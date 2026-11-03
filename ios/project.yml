@@ -1,0 +1,59 @@
+name: MicroAI
+options:
+  bundleIdPrefix: com.debanjanbasu
+  deploymentTarget:
+    iOS: "27.2"
+settings:
+  base:
+    DEVELOPMENT_TEAM: NN5K5SW2NR
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+  configs:
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: -O
+      SWIFT_COMPILATION_MODE: wholemodule
+      LLVM_LTO: YES
+      DEAD_CODE_STRIPPING: YES
+      STRIP_INSTALLED_PRODUCT: YES
+      STRIP_STYLE: all
+      ENABLE_TESTABILITY: NO
+targets:
+  MicroAI:
+    type: application
+    platform: iOS
+    sources: [MicroAI]
+    info:
+      path: MicroAI/Info.plist
+      properties:
+        CFBundleDisplayName: MicroAI
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Model files go into Documents via Finder file sharing or `devicectl device copy to`.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    # The model maps ~0.9 GB and its long-context KV grows past the default jetsam limit of a
+    # 4 GB phone. Extended virtual addressing would also help but needs a paid team.
+    entitlements:
+      path: MicroAI/MicroAI.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.debanjanbasu.microai
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: MicroAI/MicroAI-Bridging-Header.h
+        CARGO_TARGET: aarch64-apple-ios
+        "CARGO_TARGET[sdk=iphonesimulator*]": aarch64-apple-ios-sim
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/../target/$(CARGO_TARGET)/release
+        OTHER_LDFLAGS: -lmicro_ios -framework Metal -framework IOSurface -framework CoreFoundation -liconv -lobjc
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    preBuildScripts:
+      - name: Build Rust engine
+        basedOnDependencyAnalysis: false
+        script: |
+          cd "$PROJECT_DIR/.."
+          "$HOME/.cargo/bin/cargo" build --release --offline -p micro-ios --target "$CARGO_TARGET"

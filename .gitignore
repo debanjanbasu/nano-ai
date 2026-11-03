@@ -1,0 +1,7 @@
+/target/
+/.scratch/
+/cache/
+*.DS_Store
+__pycache__/
+*.pyc
+.prompt-cache/

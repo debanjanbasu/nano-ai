@@ -1,0 +1,20 @@
+[package]
+name = "micro-ios"
+version = "0.1.0"
+description = "C entry points that run the MiniCPM-V 4.7 1B engine inside an iOS app"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+micro-engine = { path = "../micro-engine" }
+micro-metal = { path = "../micro-metal" }
+serde_json.workspace = true

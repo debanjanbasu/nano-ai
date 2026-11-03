@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "micro-metal",
+    "micro-engine",
+    "micro-ai",
+    "micro-ios",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.101"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/debanjanbasu/micro-ai"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+string_slice = "deny"
+volatile_composites = "allow"
+future_not_send = "allow"
+large_futures = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+needless_range_loop = "allow"
+int_plus_one = "allow"
+missing_panics_doc = "allow"
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+half = { version = "2.7", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["aarch64_simd", "derive", "latest_stable_rust"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-case", "unicode-gencat", "unicode-perl"] }
+unicode-normalization-alignments = "0.1.12"
+sha2 = "0.11"
+memmap2 = "0.9"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3", default-features = false }
+objc2-metal = "0.3"
+objc2-core-foundation = { version = "0.3.2", default-features = false }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2", "objc2-core-foundation"] }
+zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }
+console = "0.16"
+termimad = "0.35"
+unicodeit = "0.2"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
