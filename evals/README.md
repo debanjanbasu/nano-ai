@@ -1,6 +1,6 @@
 # Quality harnesses
 
-Standard benchmarks against a running `micro-ai serve` on `127.0.0.1`:
+Standard benchmarks against a running `nano-ai serve` on `127.0.0.1`:
 
 | Harness | Script | Task |
 | --- | --- | --- |

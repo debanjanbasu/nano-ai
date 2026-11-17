@@ -7,9 +7,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 EV=$ROOT/.scratch/evals
 PORT=18097
 MODEL=${MODEL:-$ROOT/models/minicpm-v-4.7-1b/minicpm-v-4.7-1b-tern4.bin}
-cp "$ROOT/target/release/micro-ai" /tmp/micro-ai-baseline
+cp "$ROOT/target/release/nano-ai" /tmp/nano-ai-baseline
 mkdir -p "$EV/results"
-/tmp/micro-ai-baseline serve --host 127.0.0.1 --port $PORT --model "$MODEL" > "$EV/results/baseline_server.log" 2>&1 &
+/tmp/nano-ai-baseline serve --host 127.0.0.1 --port $PORT --model "$MODEL" > "$EV/results/baseline_server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
 python3 - <<EOF

@@ -71,7 +71,7 @@ kernel void ds_qk_norm_rope_kv_store_f16(
         : (k + k_src_idx);
     device const float *w = is_q ? q_norm : k_norm;
     const float val = vec[tid];
-    const float sum = micro_group_sum<256>(val * val, tid, partial);
+    const float sum = nano_group_sum<256>(val * val, tid, partial);
     const float normed = val * rsqrt(sum / 256.0f + epsilon) * w[tid];
     shared[tid] = normed;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -107,7 +107,7 @@ kernel void ds_k_norm_rope_kv_store_f16(
     const uint pos = start_pos + token;
     const ulong src_idx = (ulong(token) * DS_KV_HEADS + kv_head) * DS_HEAD_DIM + tid;
     const float val = k[src_idx];
-    const float sum = micro_group_sum<256>(val * val, tid, partial);
+    const float sum = nano_group_sum<256>(val * val, tid, partial);
     const float normed = val * rsqrt(sum / 256.0f + epsilon) * k_norm[tid];
     shared[tid] = normed;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -587,9 +587,9 @@ kernel void ds_markov_walk_pick_int4(
             const uint c = i * 256 + tid;
             dot_sum = fma(h[c], conf_w[c], dot_sum);
         }
-        const float total = micro_group_sum<256>(dot_sum, tid, partial);
+        const float total = nano_group_sum<256>(dot_sum, tid, partial);
         if (tid == 0) {
-            conf_out[s] = micro_sigmoid(total + conf_b[0]);
+            conf_out[s] = nano_sigmoid(total + conf_b[0]);
         }
         if (simd == 0) {
             const bool active = lane < DS_CAND_K;

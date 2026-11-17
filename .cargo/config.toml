@@ -8,7 +8,7 @@ rustflags = ["-C", "target-cpu=apple-m4"]
 [target.aarch64-apple-ios]
 rustflags = ["-C", "target-cpu=apple-a14"]
 
-# Latest OS targets (Xcode 27.2 SDKs): rustc's minimum OS version and the metallib's (micro-metal
+# Latest OS targets (Xcode 27.2 SDKs): rustc's minimum OS version and the metallib's (nano-metal
 # build.rs). Xcode's own exports win for app builds; these cover plain `cargo` builds.
 [env]
 MACOSX_DEPLOYMENT_TARGET = "27.2"

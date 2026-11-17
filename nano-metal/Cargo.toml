@@ -1,0 +1,24 @@
+[package]
+name = "nano-metal"
+version = "0.1.0"
+description = "Metal kernels and runtime for MiniCPM-V 4.7 1B inference on Apple Silicon"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+half.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+block2 = "0.6.2"
+objc2 = { workspace = true, features = ["exception"] }
+objc2-metal = { workspace = true, features = ["MTLDevice", "MTLBuffer", "MTLAllocation", "MTLResource", "MTLLibrary", "MTLComputePipeline", "MTLCommandEncoder", "MTLTypes", "MTLEvent", "MTLResidencySet", "MTL4CommandQueue", "MTL4CommandBuffer", "MTL4CommandAllocator", "MTL4ArgumentTable", "MTL4CommandEncoder", "MTL4ComputeCommandEncoder", "MTL4CommitFeedback", "MTL4Compiler", "MTL4ComputePipeline", "MTL4FunctionDescriptor", "MTL4LibraryFunctionDescriptor", "MTL4PipelineState", "block2"] }
+objc2-foundation = { workspace = true, default-features = true }
+objc2-core-foundation = { workspace = true, features = ["std", "CFDictionary", "CFString"] }
+objc2-io-surface = { workspace = true }
+dispatch2 = "0.3"

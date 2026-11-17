@@ -68,7 +68,7 @@ static inline void mpp_swiglu_tile(thread A &a, thread B &gate, thread B &up, th
     op.run(a, up, u);
     #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < g.get_capacity(); ++i) {
-        if (g.is_valid_element(i)) g[i] = micro_silu(g[i]) * u[i];
+        if (g.is_valid_element(i)) g[i] = nano_silu(g[i]) * u[i];
     }
     g.store(out);
 }

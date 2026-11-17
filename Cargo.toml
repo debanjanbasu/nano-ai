@@ -1,17 +1,17 @@
 [workspace]
 resolver = "3"
 members = [
-    "micro-metal",
-    "micro-engine",
-    "micro-ai",
-    "micro-ios",
+    "nano-metal",
+    "nano-engine",
+    "nano-ai",
+    "nano-ios",
 ]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.101"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/debanjanbasu/micro-ai"
+repository = "https://github.com/debanjanbasu/nano-ai"
 publish = false
 
 [workspace.lints.rust]

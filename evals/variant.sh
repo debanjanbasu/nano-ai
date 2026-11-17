@@ -11,8 +11,8 @@ MODEL=$2
 PORT=${3:-18098}
 RES=$EV/results/variants/$NAME
 mkdir -p "$RES"
-cp "$ROOT/target/release/micro-ai" "/tmp/micro-ai-variant-$NAME"
-"/tmp/micro-ai-variant-$NAME" serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" > "$RES/server.log" 2>&1 &
+cp "$ROOT/target/release/nano-ai" "/tmp/nano-ai-variant-$NAME"
+"/tmp/nano-ai-variant-$NAME" serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" > "$RES/server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
 "$ROOT/.scratch/venv-eval/bin/python" - "$PORT" "$RES/smoke.json" <<'EOF'

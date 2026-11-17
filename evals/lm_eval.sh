@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: lm_eval.sh PORT [LIMIT] [TASK...]
-# Runs lm-eval (local-completions, token-id prompts) against a micro-ai server, offline.
+# Runs lm-eval (local-completions, token-id prompts) against a nano-ai server, offline.
 # Few-shot = Open LLM Leaderboard v1 settings; arc_easy and wikitext use the lm-eval defaults (0-shot).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

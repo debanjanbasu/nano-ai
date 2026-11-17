@@ -622,65 +622,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "micro-ai"
-version = "0.1.0"
-dependencies = [
- "console",
- "micro-engine",
- "micro-metal",
- "serde",
- "serde_json",
- "syntect",
- "termimad",
- "tokio",
- "unicodeit",
-]
-
-[[package]]
-name = "micro-engine"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "half",
- "image",
- "memmap2",
- "micro-metal",
- "regex-syntax",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "unicode-normalization-alignments",
- "zstd",
-]
-
-[[package]]
-name = "micro-ios"
-version = "0.1.0"
-dependencies = [
- "micro-engine",
- "micro-metal",
- "serde_json",
-]
-
-[[package]]
-name = "micro-metal"
-version = "0.1.0"
-dependencies = [
- "block2",
- "bytemuck",
- "dispatch2",
- "half",
- "objc2",
- "objc2-core-foundation",
- "objc2-foundation",
- "objc2-io-surface",
- "objc2-metal",
- "thiserror",
-]
-
-[[package]]
 name = "minimad"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +670,65 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "nano-ai"
+version = "0.1.0"
+dependencies = [
+ "console",
+ "nano-engine",
+ "nano-metal",
+ "serde",
+ "serde_json",
+ "syntect",
+ "termimad",
+ "tokio",
+ "unicodeit",
+]
+
+[[package]]
+name = "nano-engine"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "half",
+ "image",
+ "memmap2",
+ "nano-metal",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "unicode-normalization-alignments",
+ "zstd",
+]
+
+[[package]]
+name = "nano-ios"
+version = "0.1.0"
+dependencies = [
+ "nano-engine",
+ "nano-metal",
+ "serde_json",
+]
+
+[[package]]
+name = "nano-metal"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "bytemuck",
+ "dispatch2",
+ "half",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-io-surface",
+ "objc2-metal",
+ "thiserror",
 ]
 
 [[package]]

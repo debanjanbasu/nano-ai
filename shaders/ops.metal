@@ -32,7 +32,7 @@ kernel void mc_rms(
         const float value = input[ulong(row) * stride + i];
         square_sum = fma(value, value, square_sum);
     }
-    const float sum = micro_group_sum<128>(square_sum, tid, partial);
+    const float sum = nano_group_sum<128>(square_sum, tid, partial);
     const float inverse = rsqrt(sum / float(dimension) + epsilon);
     for (uint i = tid; i < dimension; i += 128) {
         const ulong index = ulong(row) * stride + i;
@@ -62,7 +62,7 @@ kernel void mc_rms_fwht512(
         const float value = input[row_base + i];
         square_sum = fma(value, value, square_sum);
     }
-    const float sum = micro_group_sum<128>(square_sum, tid, partial);
+    const float sum = nano_group_sum<128>(square_sum, tid, partial);
     const float inverse = rsqrt(sum / float(dimension) + epsilon);
     const uint blocks_per_row = dimension / 512;
     if (tid < 64) {
@@ -113,7 +113,7 @@ kernel void mc_add_rms(
         row_s[i] = s;
         square_sum = fma(s, s, square_sum);
     }
-    const float sum = micro_group_sum<128>(square_sum, tid, partial);
+    const float sum = nano_group_sum<128>(square_sum, tid, partial);
     const float inverse = rsqrt(sum / float(dimension) + epsilon);
     for (uint i = tid; i < dimension; i += 128) {
         row_n[i] = row_s[i] * inverse * weights[i];
@@ -144,7 +144,7 @@ kernel void mc_add_rms_fwht512(
         sum_out[row_base + i] = s;
         square_sum = fma(s, s, square_sum);
     }
-    const float sum = micro_group_sum<128>(square_sum, tid, partial);
+    const float sum = nano_group_sum<128>(square_sum, tid, partial);
     const float inverse = rsqrt(sum / float(dimension) + epsilon);
     const uint blocks_per_row = dimension / 512;
     if (tid < 64) {
@@ -190,7 +190,7 @@ kernel void mc_add_rms_tap(
         if (write_tap) row_t[i] = s;
         square_sum = fma(s, s, square_sum);
     }
-    const float sum = micro_group_sum<128>(square_sum, tid, partial);
+    const float sum = nano_group_sum<128>(square_sum, tid, partial);
     const float inverse = rsqrt(sum / float(dimension) + epsilon);
     for (uint i = tid; i < dimension; i += 128) {
         row_n[i] = row_s[i] * inverse * weights[i];
@@ -204,7 +204,7 @@ kernel void mc_swiglu(
     constant uint &count [[buffer(3)]],
     uint i [[thread_position_in_grid]]
 ) {
-    if (i < count) output[i] = micro_silu(gate[i]) * up[i];
+    if (i < count) output[i] = nano_silu(gate[i]) * up[i];
 }
 
 // ----------------------------------------------------------------------------
@@ -234,7 +234,7 @@ static inline void mc_conv_impl(
         h0 = h1;
         h1 = h2;
         h2 = input[index];
-        output[index] = micro_silu(sum);
+        output[index] = nano_silu(sum);
         if (token + 1 == commit_tokens) {
             final_history[h] = h0;
             final_history[h + 1] = h1;
@@ -253,7 +253,7 @@ static inline void mc_l2_qk_impl(
     // 32 Q/K heads of 128 each = first 4096 floats of the 6144-wide row
     const uint index = (head / 32) * MC_CONV_CHANNELS + (head % 32) * 128 + tid;
     const float value = qkv[index];
-    const float sum = micro_group_sum<128>(value * value, tid, partial);
+    const float sum = nano_group_sum<128>(value * value, tid, partial);
     qkv[index] = value / max(sqrt(sum), epsilon);
 }
 
@@ -272,7 +272,7 @@ static inline void mc_decay_impl(
     const float x = alpha[head] + dt[h];
     const float softplus = x > 20.0f ? x : log(1.0f + exp(x));
     decay[head] = exp(a[h] * softplus);
-    beta[head] = micro_sigmoid(raw_beta[head]);
+    beta[head] = nano_sigmoid(raw_beta[head]);
 }
 
 // Fused conv + L2 Q/K norm + decay/beta over a block of tokens.
@@ -320,7 +320,7 @@ kernel void mc_conv_l2_decay(
                 h0 = h1;
                 h1 = h2;
                 h2 = x;
-                const float c = micro_silu(sum);
+                const float c = nano_silu(sum);
                 conv_vals[token] = c;
                 if (group >= 32) {
                     output[index] = c;
@@ -601,8 +601,8 @@ kernel void mc_gdn_post(
     threadgroup float partial[4];
     const uint index = head * 128 + tid;
     const float value = input[index];
-    const float sum = micro_group_sum<128>(value * value, tid, partial);
-    output[index] = value * rsqrt(sum / 128.0f + epsilon) * weights[tid] * micro_silu(gate[index]);
+    const float sum = nano_group_sum<128>(value * value, tid, partial);
+    output[index] = value * rsqrt(sum / 128.0f + epsilon) * weights[tid] * nano_silu(gate[index]);
 }
 
 // ----------------------------------------------------------------------------
@@ -707,7 +707,7 @@ kernel void mc_attn_prep(
     device const float *qg_row = qg + token * 4096;
     device const float *key_row = key + token * 512;
     const float q = qg_row[head * 512 + tid];
-    const float q_sum = micro_group_sum<256>(q * q, tid, partial);
+    const float q_sum = nano_group_sum<256>(q * q, tid, partial);
     float roped = mc_text_rope(qg_row + head * 512, q_weights,
         rsqrt(q_sum / 256.0f + epsilon), tid, rope, base);
     if (rotate) roped = hadamard256(roped, tid, scratch);
@@ -716,7 +716,7 @@ kernel void mc_attn_prep(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (head < 2) {
         const float k = key_row[head * 256 + tid];
-        const float k_sum = micro_group_sum<256>(k * k, tid, partial);
+        const float k_sum = nano_group_sum<256>(k * k, tid, partial);
         float rotated = mc_text_rope(key_row + head * 256, k_weights,
             rsqrt(k_sum / 256.0f + epsilon), tid, rope, base);
         if (rotate) {
@@ -1076,9 +1076,9 @@ kernel void mc_attn_reduce(
     const uint index = head * 256 + tid;
     if (rotated) {
         const float value = hadamard256(numerator / denominator, tid, scratch);
-        output[index] = value * (gated ? micro_sigmoid(gate[index]) : 1.0f);
+        output[index] = value * (gated ? nano_sigmoid(gate[index]) : 1.0f);
     } else {
-        output[index] = (numerator / denominator) * (gated ? micro_sigmoid(gate[index]) : 1.0f);
+        output[index] = (numerator / denominator) * (gated ? nano_sigmoid(gate[index]) : 1.0f);
     }
 }
 

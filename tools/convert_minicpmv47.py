@@ -1,4 +1,4 @@
-"""Convert MiniCPM-V-4.7-1B and MiniCPM-V-4.7-1B-DSpark into micro-ai's
+"""Convert MiniCPM-V-4.7-1B and MiniCPM-V-4.7-1B-DSpark into nano-ai's
 zero-copy 16-KiB page-aligned Metal artifacts:
   - minicpm-v-4.7-1b-tern4.bin  (~374 MB: PTQ1_0 ternary embed_tokens & lm_head + INT4_G64 24 decoder layers)
   - minicpm-v-4.7-1b-int4.bin   (~540 MB: INT4_G64 everything)
@@ -42,7 +42,7 @@ PINNED_DSPARK_SAFETENSORS = (
 
 
 def deterministic_signs(columns: int) -> list[float]:
-    """Match micro_engine::quant::deterministic_signs bit-for-bit."""
+    """Match nano_engine::quant::deterministic_signs bit-for-bit."""
     mask = 0xFFFF_FFFF_FFFF_FFFF
     state = (columns ^ 0x9E37_79B9_7F4A_7C15) & mask
     out = []
@@ -1365,7 +1365,7 @@ def fetch_verified(repo, rev, fname, expected_size, expected_sha):
     log("Fetching", url)
     h = hashlib.sha256()
     n = 0
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "micro-ai/1"}), timeout=120) as r, open(dest, "wb") as f:
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "nano-ai/1"}), timeout=120) as r, open(dest, "wb") as f:
         while chunk := r.read(1 << 22):
             h.update(chunk)
             f.write(chunk)

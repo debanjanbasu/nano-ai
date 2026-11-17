@@ -1,4 +1,4 @@
-"""Tool-calling smoke for the micro-ai server: OpenAI `tools`, streaming, tool results, agent flow.
+"""Tool-calling smoke for the nano-ai server: OpenAI `tools`, streaming, tool results, agent flow.
 
 Usage: python smoke_toolcall.py [BASE_URL]   (default http://127.0.0.1:18093/v1)
 """

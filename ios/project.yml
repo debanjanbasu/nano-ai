@@ -1,4 +1,4 @@
-name: MicroAI
+name: NanoAI
 options:
   bundleIdPrefix: com.debanjanbasu
   deploymentTarget:
@@ -18,14 +18,14 @@ settings:
       STRIP_STYLE: all
       ENABLE_TESTABILITY: NO
 targets:
-  MicroAI:
+  NanoAI:
     type: application
     platform: iOS
-    sources: [MicroAI]
+    sources: [NanoAI]
     info:
-      path: MicroAI/Info.plist
+      path: NanoAI/Info.plist
       properties:
-        CFBundleDisplayName: MicroAI
+        CFBundleDisplayName: NanoAI
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -38,22 +38,22 @@ targets:
     # The model maps ~0.9 GB and its long-context KV grows past the default jetsam limit of a
     # 4 GB phone. Extended virtual addressing would also help but needs a paid team.
     entitlements:
-      path: MicroAI/MicroAI.entitlements
+      path: NanoAI/NanoAI.entitlements
       properties:
         com.apple.developer.kernel.increased-memory-limit: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.debanjanbasu.microai
+        PRODUCT_BUNDLE_IDENTIFIER: com.debanjanbasu.nanoai
         TARGETED_DEVICE_FAMILY: "1,2"
-        SWIFT_OBJC_BRIDGING_HEADER: MicroAI/MicroAI-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: NanoAI/NanoAI-Bridging-Header.h
         CARGO_TARGET: aarch64-apple-ios
         "CARGO_TARGET[sdk=iphonesimulator*]": aarch64-apple-ios-sim
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/../target/$(CARGO_TARGET)/release
-        OTHER_LDFLAGS: -lmicro_ios -framework Metal -framework IOSurface -framework CoreFoundation -liconv -lobjc
+        OTHER_LDFLAGS: -lnano_ios -framework Metal -framework IOSurface -framework CoreFoundation -liconv -lobjc
         ENABLE_USER_SCRIPT_SANDBOXING: NO
     preBuildScripts:
       - name: Build Rust engine
         basedOnDependencyAnalysis: false
         script: |
           cd "$PROJECT_DIR/.."
-          "$HOME/.cargo/bin/cargo" build --release --offline -p micro-ios --target "$CARGO_TARGET"
+          "$HOME/.cargo/bin/cargo" build --release --offline -p nano-ios --target "$CARGO_TARGET"

@@ -1,4 +1,4 @@
-# micro-ai
+# nano-ai
 
 Native Rust and Metal inference engine for **MiniCPM-V 4.7 1B** (`openbmb/MiniCPM-V-4.7-1B`) and its **DSpark** speculative drafter (`openbmb/MiniCPM-V-4.7-1B-DSpark`) on Apple Silicon Macs and iPhones/iPads.
 
@@ -9,7 +9,7 @@ Targets the latest Apple platforms only: macOS / iOS 27.2 (Xcode 27.2 SDKs), Met
 1. **3-in-1 Fused Multimodal Artifact (`MCV47` = Language + Vision + DSpark), File-Backed and Zero-Copy**
    - All **842 tensors** across the 24-layer Language Model, 27-layer `SigLIP2` + Window-Attention Merger Vision Tower, and 5-layer `DSpark` speculative drafter live in **one file (`minicpm-v-4.7-1b-tern4.bin`)**. Every matrix is AWQ + WLS **`INT4_G64`** (4-bit, group-64 FP14 `(scale, bias)`), except the 16-row GDN `in_proj_a/b` (BF16) and norms/biases (F32).
    - **Tied Embedding / LM-Head:** one `[248094, 1024]` `INT4_G64` table serves `embed_tokens.weight` and `lm_head.weight`.
-   - **Compressed on disk (`713.5 MiB` model + `2.8 MiB` `tokenizer.bin` = `716.3 MiB` total), zero-copy in Metal:** `micro-ai convert` rounds `INT4_G64` `(scale, bias)` to FP14 with `q` re-snapping, compresses the fused artifact with `zstd_col_delta` (8 MiB frames decoded across all CPU cores in ~150 ms on M4 Pro into a page-aligned `Mmap`, or mapped file-backed when stored raw), and Zstd-compresses `tokenizer.bin` (`2.8 MiB`, decoded in < 3 ms), eliminating `tokenizer.json` (`-19.1 MiB`).
+   - **Compressed on disk (`713.5 MiB` model + `2.8 MiB` `tokenizer.bin` = `716.3 MiB` total), zero-copy in Metal:** `nano-ai convert` rounds `INT4_G64` `(scale, bias)` to FP14 with `q` re-snapping, compresses the fused artifact with `zstd_col_delta` (8 MiB frames decoded across all CPU cores in ~150 ms on M4 Pro into a page-aligned `Mmap`, or mapped file-backed when stored raw), and Zstd-compresses `tokenizer.bin` (`2.8 MiB`, decoded in < 3 ms), eliminating `tokenizer.json` (`-19.1 MiB`).
 2. **MiniCPM-V 4.7 1B Language Model: 24-Layer Hybrid with the Full 262,144-Token Context on Every Device**
    - **18 Gated DeltaNet Recurrent Layers:** Fused 6144-channel `conv1d` + L2 Q/K normalization + `softplus` decay/beta kernel (`mc_conv_l2_decay`), F16 recurrent state `[16 * 128][128]` with F32 register recurrence (`mc_gdn_rows_4_f16`), and zero-copy speculative state rollback.
    - **6 Full-Attention Layers:** Canvas 3D M-RoPE (`sections = [11, 11, 10]`, `partial_rotary_factor = 0.25`), Hadamard-256 rotated KV cache in 8 bits (**6.4 KiB/token** across all 6 layers, K + V) when a full-window cache fits the device's memory budget, else 4 bits (3.4 KiB/token), starting at 1,024 tokens and doubling on demand up to **`MAX_CONTEXT_TOKENS = 262,144`**.
@@ -47,7 +47,7 @@ Targets the latest Apple platforms only: macOS / iOS 27.2 (Xcode 27.2 SDKs), Met
 7. **Compact Tokenizer (`tokenizer.bin`)**
    - The byte-level BPE (added tokens, NFC, the pre-tokenizer regex hand-coded over the same Unicode tables, merge-rank BPE with reusable scratch buffers, streaming UTF-8 decode) loads from a **2.8 MiB** Zstd-compressed binary (`6.5 MiB` uncompressed in memory), replacing ~100 MiB of `tokenizers` heap and `tokenizer.json`.
 
-8. **OpenAI-Compatible Server for Agent and Coding Harnesses (`micro-ai serve`)**
+8. **OpenAI-Compatible Server for Agent and Coding Harnesses (`nano-ai serve`)**
    - `/v1/chat/completions` renders the model's own chat template byte for byte, including `tools`, assistant `tool_calls`, grouped `tool` results, `reasoning_content` and `enable_thinking` (**enabled by default**, matching the upstream `chat_template.jinja`, and dynamically bounded by RPDI entropy saturation and DRY n-gram loop detection). It parses `<tool_call><function=…><parameter=…>` (and JSON-body fallbacks) into `tool_calls`, typing each argument by its JSON schema, and supports `tool_choice` (`none`, `auto`, `required`, a named function), `stop`, and streaming with `delta.tool_calls`.
    - `/v1/completions` accepts string or token-id prompts. With `echo` / `logprobs` it scores the prompt teacher-forced in 128-row blocks, which is the mode lm-evaluation-harness uses for multiple-choice and perplexity tasks.
    - `/v1/chat/completions`, `chat` and `agents` default `max_tokens` to the full **`MAX_CONTEXT_TOKENS = 262,144`** window.
@@ -101,18 +101,18 @@ live 55.81% vs 60.10%, irrelevance detection 79.96% vs 51.09%.
 cargo test --offline
 
 # Fuse the converter outputs into the raw artifact and swap tokenizer.json for tokenizer.bin
-cargo run --release --offline -p micro-ai -- convert --dir models/minicpm-v-4.7-1b
+cargo run --release --offline -p nano-ai -- convert --dir models/minicpm-v-4.7-1b
 
 # Run 24-layer Metal + ANE benchmark on Apple Silicon
-cargo run --release --offline -p micro-ai -- bench
+cargo run --release --offline -p nano-ai -- bench
 
 # Interactive / single-turn multimodal chat
-cargo run --release --offline -p micro-ai -- chat --image path/to/image.png "Describe this image."
+cargo run --release --offline -p nano-ai -- chat --image path/to/image.png "Describe this image."
 # Text chat (DSpark + Vision + Tokenizer auto-loaded from model directory)
-cargo run --release --offline -p micro-ai -- chat "Explain Gated DeltaNet in two sentences."
+cargo run --release --offline -p nano-ai -- chat "Explain Gated DeltaNet in two sentences."
 
 # Start local OpenAI-compatible server with zstd-dict compression
-cargo run --release --offline -p micro-ai -- serve --host 127.0.0.1 --port 8080
+cargo run --release --offline -p nano-ai -- serve --host 127.0.0.1 --port 8080
 # Fetch the trained Zstd dictionary for zstd-dict client compression/decompression
 curl -s http://127.0.0.1:8080/v1/zstd-dict -o http_zstd.dict
 ```
@@ -132,22 +132,40 @@ python3 evals/niah.py 8080 16384,65536
 
 ### iPhone / iPad
 
-`ios/` holds a small SwiftUI host app (`MicroAI`) that links the engine through `micro-ios` (a static library with `micro_ai_run`, `micro_ai_warm` and `micro_ai_free`). It keeps one engine open across prompts. At launch `micro_ai_warm("")` opens the engine and pins the system turn (restored from the on-disk prompt cache on later launches). While you type, a debounced `micro_ai_warm(text)` prefills the prompt so far, so Run only prefills the last few tokens.
+`ios/` holds a small SwiftUI host app (`NanoAI`) that links the engine through `nano-ios` (a static library with `nano_ai_run`, `nano_ai_warm` and `nano_ai_free`). It keeps one engine open across prompts. At launch `nano_ai_warm("")` opens the engine and pins the system turn (restored from the on-disk prompt cache on later launches). While you type, a debounced `nano_ai_warm(text)` prefills the prompt so far, so Run only prefills the last few tokens.
 
 The project targets iOS 27.2 with Swift 6 (whole-module `-O`, LTO, dead-code stripping in Release) and links the engine built for `aarch64-apple-ios` with `target-cpu=apple-a14`. It requests the `increased-memory-limit` entitlement, which personal teams can sign; `extended-virtual-addressing` needs a paid team. Set `DEVELOPMENT_TEAM` in `ios/project.yml`, sign in to Xcode with that team, enable Developer Mode on the device, and trust the developer profile on it (Settings → General → VPN & Device Management).
 
 ```bash
 cd ios && xcodegen generate && cd ..
 UDID=<device id from `xcrun devicectl list devices`>
-xcodebuild -project ios/MicroAI.xcodeproj -scheme MicroAI -configuration Release \
+xcodebuild -project ios/NanoAI.xcodeproj -scheme NanoAI -configuration Release \
   -destination "id=$UDID" -derivedDataPath target/ios-dd -allowProvisioningUpdates build
-xcrun devicectl device install app --device $UDID target/ios-dd/Build/Products/Release-iphoneos/MicroAI.app
+xcrun devicectl device install app --device $UDID target/ios-dd/Build/Products/Release-iphoneos/NanoAI.app
 # Model files live in the app's Documents (Finder file sharing works too)
 for f in minicpm-v-4.7-1b-tern4.bin tokenizer.bin; do
   xcrun devicectl device copy to --device $UDID --domain-type appDataContainer \
-    --domain-identifier com.debanjanbasu.microai --source models/minicpm-v-4.7-1b/$f --destination Documents/$f
+    --domain-identifier com.debanjanbasu.nanoai --source models/minicpm-v-4.7-1b/$f --destination Documents/$f
 done
 # Headless run: one JSON report per --prompt (speed, memory, ANE status), then the app exits
 xcrun devicectl device process launch --device $UDID --console --terminate-existing \
-  com.debanjanbasu.microai --prompt "Explain Gated DeltaNet in two sentences." --max-tokens 200
+  com.debanjanbasu.nanoai --prompt "Explain Gated DeltaNet in two sentences." --max-tokens 200
 ```
+
+## License
+
+The **code** in this repository is dual-licensed under either of:
+
+- [MIT](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)
+
+at your option.
+
+The **model weights and tokenizer** in `models/` are converted artifacts of the third-party
+[MiniCPM-V 4.7 1B](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B) and
+[MiniCPM-V-4.7-1B-DSpark](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-DSpark) models by OpenBMB.
+Both upstream models are published under the **Apache License 2.0**, so those terms apply to the
+converted weights as well; this repository's dual license covers the code, not the weights.
+
+Everything under `models/` is tracked with [Git LFS](https://git-lfs.com/); run `git lfs install`
+before cloning so the large files are fetched correctly.

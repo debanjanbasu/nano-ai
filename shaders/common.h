@@ -1,15 +1,15 @@
 // Shared math, reductions, and PTQ1_0 / Hadamard primitives for MiniCPM-V 4.7 1B.
-#ifndef MICRO_COMMON_H
-#define MICRO_COMMON_H
+#ifndef NANO_COMMON_H
+#define NANO_COMMON_H
 
 #include <metal_stdlib>
 using namespace metal;
 
-static inline float micro_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
-static inline float micro_silu(float x) { return x * micro_sigmoid(x); }
+static inline float nano_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+static inline float nano_silu(float x) { return x * nano_sigmoid(x); }
 
 template<uint threads>
-static inline float micro_group_sum(float value, uint tid, threadgroup float *partial) {
+static inline float nano_group_sum(float value, uint tid, threadgroup float *partial) {
     const float sum = simd_sum(value);
     if (tid % 32 == 0) partial[tid / 32] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);

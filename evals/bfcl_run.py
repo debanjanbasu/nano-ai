@@ -1,4 +1,4 @@
-"""bfcl CLI with two extra registry entries for MiniCPM-V 4.7 (Qwen3.5 XML tool format) on a micro-ai server.
+"""bfcl CLI with two extra registry entries for MiniCPM-V 4.7 (Qwen3.5 XML tool format) on a nano-ai server.
 
 - minicpm-v-4.7-1b-xml: prompt mode. Renders the official chat template (tools=...) with the HF tokenizer, calls
   /v1/completions, and parses `<tool_call><function=NAME><parameter=P>V</parameter></function></tool_call>`,
@@ -166,7 +166,7 @@ class MiniCPMV47FCHandler(OpenAICompletionsHandler):
 
 
 def config(display, handler):
-    return ModelConfig(model_name="minicpm-v-4.7-1b", display_name=display, url="local micro-ai", org="openbmb",
+    return ModelConfig(model_name="minicpm-v-4.7-1b", display_name=display, url="local nano-ai", org="openbmb",
                        license="apache-2.0", model_handler=handler, input_price=None, output_price=None,
                        is_fc_model=True, underscore_to_dot=True)  # both send OpenAI-style tool names (dots -> _)
 

@@ -1,4 +1,4 @@
-"""Long-context probe against `micro-ai serve`: needle-in-a-haystack retrieval over real Rust source,
+"""Long-context probe against `nano-ai serve`: needle-in-a-haystack retrieval over real Rust source,
 reporting prefill/decode speed from the server's telemetry. Usage: niah.py PORT TOKENS[,TOKENS...] [DEPTH]"""
 import glob, json, os, random, sys, time, urllib.request
 

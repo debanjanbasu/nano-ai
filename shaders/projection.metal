@@ -231,7 +231,7 @@ kernel void int8_matvec_swiglu(
     #pragma clang loop unroll(full)
     for (uint r = 0; r < 2; ++r) {
         if (lane == r && first_row + r < rows) {
-            output[first_row + r] = micro_silu(sums[r]) * sums[2 + r];
+            output[first_row + r] = nano_silu(sums[r]) * sums[2 + r];
         }
     }
 }
@@ -504,7 +504,7 @@ template<uint T>
         #pragma clang loop unroll(full)
         for (uint t = 0; t < T; ++t) {
             if (lane == r * T + t && t < tokens && first_row + r < rows) {
-                output[ulong(t) * rows + first_row + r] = micro_silu(acc[r * T + t]) * acc[(2 + r) * T + t];
+                output[ulong(t) * rows + first_row + r] = nano_silu(acc[r * T + t]) * acc[(2 + r) * T + t];
             }
         }
     }
@@ -876,7 +876,7 @@ template<uint S>
             up_val += shared[(split + s) * 64 + lane * 2 + r];
         }
         const uint row = first_row + fn + r;
-        if (row < rows) output[ulong(fm) * rows + row] = micro_silu(gate_val) * up_val;
+        if (row < rows) output[ulong(fm) * rows + row] = nano_silu(gate_val) * up_val;
     }
 }
 
@@ -1068,7 +1068,7 @@ kernel void ptq1_matvec_swiglu(
     #pragma clang loop unroll(full)
     for (uint row = 0; row < 4; ++row) {
         if (lane == 0 && first_row + row < rows) {
-            output[first_row + row] = micro_silu(sums[row]) * sums[4 + row];
+            output[first_row + row] = nano_silu(sums[row]) * sums[4 + row];
         }
     }
 }
