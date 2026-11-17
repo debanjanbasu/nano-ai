@@ -30,6 +30,41 @@ use crate::vision::{
     NEWLINE_ID, SLICE_END_ID, SLICE_START_ID, compute_canvas_mrope,
 };
 
+/// Switching the KV format must resize the cache buffers to match the new format.
+///
+/// Each format stores a different number of bytes per token (F16 1024, Q8 544, Q4 288), and the
+/// attention kernels write `format.token_bytes()` bytes per cached token. Reusing the buffers
+/// from the previous format would write past the end of the allocation.
+#[test]
+fn kv_cache_buffers_are_resized_when_the_format_changes() {
+    if MetalContext::new().is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("micro_ai_kv_format_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let model_path = dir.join("kv_format.bin");
+    write_synthetic_lm_artifact(&model_path, true).unwrap();
+    let mut engine = MicroEngine::open(&model_path).unwrap();
+
+    for format in [KvFormat::F16, KvFormat::Q8, KvFormat::Q4, KvFormat::F16] {
+        engine.set_kv_format(format);
+        let (buffers, capacity) = engine.kv_cache_geometry();
+        let expected = capacity * format.token_bytes();
+        assert!(!buffers.is_empty(), "expected at least one attention layer");
+        for (i, (k, v)) in buffers.iter().enumerate() {
+            assert_eq!(
+                *k, expected,
+                "layer {i} K cache holds {k} bytes, but {format:?} needs {expected}"
+            );
+            assert_eq!(
+                *v, expected,
+                "layer {i} V cache holds {v} bytes, but {format:?} needs {expected}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The 1- and 2-token fused kernels (Q/K/V concat, Gated `DeltaNet` input projection with BF16
 /// `a`/`b`, `SwiGLU`) must agree with the multi-token kernels and a CPU BF16 reference.
 #[test]

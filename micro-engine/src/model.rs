@@ -563,6 +563,9 @@ impl MicroEngine {
     }
 
     /// Switch the full-attention KV cache format (`KvFormat::Q8` or `KvFormat::Q4`) and clear prefix checkpoints.
+    ///
+    /// The KV buffers are sized for the current format's bytes per token, so a wider format needs
+    /// new buffers: keeping the old ones would write past their end.
     pub fn set_kv_format(&mut self, format: KvFormat) {
         if format != self.kv_format
             && let Some(disk) = self.disk_cache.take()
@@ -570,8 +573,45 @@ impl MicroEngine {
             self.disk_cache = disk.reopen(format);
         }
         self.kv_format = format;
+        self.reallocate_kv_buffers();
         self.prefix_cache.clear();
         self.reset();
+    }
+
+    /// Reallocate the KV caches for the current format and capacity, dropping their contents.
+    ///
+    /// Each layer gets its own allocation, as it does at construction: `MetalBuffer` is
+    /// handle-based, so handing the same buffer to two layers would make them overwrite each
+    /// other's cache.
+    ///
+    /// If the allocation fails the old buffers stay in place, so the cache keeps its old size;
+    /// the next `ensure_kv_capacity` then reallocates at the new format's size.
+    fn reallocate_kv_buffers(&mut self) {
+        let bytes = self.kv_capacity * self.kv_format.token_bytes();
+        let dev = self.ctx.device();
+        for cache in &mut self.attention_caches {
+            let Ok(new_k) = MetalBuffer::empty(dev, bytes) else {
+                return;
+            };
+            let Ok(new_v) = MetalBuffer::empty(dev, bytes) else {
+                return;
+            };
+            cache.k_cache = new_k;
+            cache.v_cache = new_v;
+        }
+    }
+
+    /// The KV cache buffers and the capacity they are sized for, for tests that assert the
+    /// buffers match the current KV format.
+    #[cfg(test)]
+    pub(crate) fn kv_cache_geometry(&self) -> (Vec<(usize, usize)>, usize) {
+        (
+            self.attention_caches
+                .iter()
+                .map(|c| (c.k_cache.length(), c.v_cache.length()))
+                .collect(),
+            self.kv_capacity,
+        )
     }
 
     pub fn reset(&mut self) {

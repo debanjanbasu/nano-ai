@@ -8,19 +8,24 @@ EV=$ROOT/.scratch/evals
 PORT=18097
 MODEL=${MODEL:-$ROOT/models/minicpm-v-4.7-1b/minicpm-v-4.7-1b-tern4.bin}
 cp "$ROOT/target/release/micro-ai" /tmp/micro-ai-baseline
+mkdir -p "$EV/results"
 /tmp/micro-ai-baseline serve --host 127.0.0.1 --port $PORT --model "$MODEL" > "$EV/results/baseline_server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
 python3 - <<EOF
-import time, urllib.request
+import time, urllib.request, sys
 for _ in range(600):
     try:
-        urllib.request.urlopen("http://127.0.0.1:$PORT/health", timeout=2); break
+        urllib.request.urlopen("http://127.0.0.1:$PORT/health", timeout=2); sys.exit(0)
     except Exception:
         time.sleep(0.5)
+sys.exit(1)
 EOF
+if [ $? -ne 0 ]; then
+    echo "server did not come up on port $PORT; see $EV/results/baseline_server.log" >&2
+    exit 1
+fi
 cd "$EV"
-mkdir -p results
 bash "$ROOT/evals/lm_eval.sh" $PORT "" arc_easy gsm8k wikitext arc_challenge
 bash "$ROOT/evals/lm_eval.sh" $PORT 20 mmlu
 bash "$ROOT/evals/lm_eval.sh" $PORT 500 hellaswag
