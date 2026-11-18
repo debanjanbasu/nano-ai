@@ -13,7 +13,7 @@ use nano_metal::shaders::ShaderLibrary;
 use nano_metal::vision::{Epilogue, Linear, VISION_WIDTH, VisionKernels};
 
 use crate::Error;
-use crate::artifact::{MappedArtifact, TensorDtype, VIS_MAGIC};
+use crate::artifact::{MappedArtifact, MatrixHandle, VIS_MAGIC};
 use crate::ane_ffn::{VisionAneOffload, VisionAneState};
 use crate::model::WIDTH;
 pub const PATCH_SIZE: usize = 14;
@@ -610,6 +610,31 @@ pub struct VisionEncoder {
     dummy_mean: MetalBuffer,
     merger_mid: MetalBuffer,
     out_buf: MetalBuffer,
+    /// Per-layer tensors resolved once at open, so `build_crop_batch` does no per-crop
+    /// tensor-name lookups (`project_linear` indexes these instead of the artifact map).
+    layer_weights: Vec<VisionLayerWeights>,
+}
+
+/// One `SigLIP2` layer's resolved tensors: handles for the projections, payload offsets for the
+/// F32 layer norms and biases.
+#[derive(Clone, Copy)]
+struct VisionLayerWeights {
+    ln1_w: usize,
+    ln1_b: usize,
+    ln2_w: usize,
+    ln2_b: usize,
+    q: MatrixHandle,
+    k: MatrixHandle,
+    v: MatrixHandle,
+    q_bias: usize,
+    k_bias: usize,
+    v_bias: usize,
+    out: MatrixHandle,
+    out_bias: usize,
+    fc1: MatrixHandle,
+    fc1_bias: usize,
+    fc2: MatrixHandle,
+    fc2_bias: usize,
 }
 
 impl VisionEncoder {
@@ -640,7 +665,7 @@ impl VisionEncoder {
         let dummy_mean = MetalBuffer::empty(dev, 16)?;
         let merger_mid = MetalBuffer::empty(dev, (max_p / 4) * VISION_MERGER_FFN * 4)?;
         let out_buf = MetalBuffer::empty(dev, (max_p / 4) * WIDTH * 4)?;
-        Ok(Self {
+        let mut encoder = Self {
             artifact,
             kernels,
             ane: VisionAneState::start(),
@@ -656,7 +681,41 @@ impl VisionEncoder {
             dummy_mean,
             merger_mid,
             out_buf,
-        })
+            layer_weights: Vec::new(),
+        };
+        encoder.resolve_layer_weights()?;
+        Ok(encoder)
+    }
+
+    /// Resolve the 27 `SigLIP2` layers' tensor names once, so each crop's encode pass indexes
+    /// this table instead of formatting names into the artifact's map.
+    fn resolve_layer_weights(&mut self) -> crate::Result<()> {
+        self.layer_weights = (0..VISION_LAYERS)
+            .map(|layer| {
+                let p = format!("model.vision_tower.encoder.layers.{layer}");
+                let m = |name: &str| self.artifact.matrix_handle(&format!("{p}.{name}"));
+                let f = |name: &str| Ok::<_, Error>(self.artifact.f32_slice(&format!("{p}.{name}"))?.1);
+                Ok(VisionLayerWeights {
+                    ln1_w: f("layer_norm1.weight")?,
+                    ln1_b: f("layer_norm1.bias")?,
+                    ln2_w: f("layer_norm2.weight")?,
+                    ln2_b: f("layer_norm2.bias")?,
+                    q: m("self_attn.q_proj.weight")?,
+                    k: m("self_attn.k_proj.weight")?,
+                    v: m("self_attn.v_proj.weight")?,
+                    q_bias: f("self_attn.q_proj.bias")?,
+                    k_bias: f("self_attn.k_proj.bias")?,
+                    v_bias: f("self_attn.v_proj.bias")?,
+                    out: m("self_attn.out_proj.weight")?,
+                    out_bias: f("self_attn.out_proj.bias")?,
+                    fc1: m("mlp.fc1.weight")?,
+                    fc1_bias: f("mlp.fc1.bias")?,
+                    fc2: m("mlp.fc2.weight")?,
+                    fc2_bias: f("mlp.fc2.bias")?,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(())
     }
 
     fn take_ane(&mut self, ctx: &MetalContext, shaders: &ShaderLibrary) -> Option<Box<VisionAneOffload>> {
@@ -683,6 +742,7 @@ impl VisionEncoder {
         }
     }
 
+    /// Name-based projection for the once-per-crop `vit_merger` path (2 lookups, not hot).
     fn project_linear(
         &self,
         batch: &mut CommandBatch,
@@ -695,40 +755,38 @@ impl VisionEncoder {
         tokens: u32,
         epilogue: Epilogue,
     ) -> crate::Result<()> {
-        let desc = self.artifact.descriptor(weight_name)?;
-        let (bias_buf, bias_off, _) = self.artifact.f32_slice(bias_name)?;
-        if desc.dtype == TensorDtype::F32 {
-            let (rows, columns) = if desc.shape[0] == 1 && desc.shape[1] == VISION_WIDTH as usize * VISION_FFN {
-                (VISION_WIDTH, VISION_FFN as u32)
-            } else if desc.shape[0] == 1 && desc.shape[1] == VISION_WIDTH as usize * VISION_MERGER_FFN {
-                (VISION_WIDTH, VISION_MERGER_FFN as u32)
-            } else {
-                (desc.shape[0] as u32, desc.shape[1] as u32)
-            };
-            self.kernels.gemm(
-                batch,
-                Linear {
-                    f32: true,
-                    weights: &self.artifact.payload_buffer,
-                    weights_offset: desc.offset,
-                    bias: bias_buf,
-                    bias_offset: bias_off,
-                    rows,
-                    columns,
-                },
-                input,
-                output,
-                tokens,
-                epilogue,
-            );
-            return Ok(());
-        }
-        let (mat, _) = self.artifact.matrix(weight_name)?;
+        self.project_linear_resolved(
+            batch,
+            proj,
+            self.artifact.matrix_handle(weight_name)?,
+            self.artifact.f32_slice(bias_name)?.1,
+            input,
+            scratch,
+            output,
+            tokens,
+            epilogue,
+        )
+    }
+
+    fn project_linear_resolved(
+        &self,
+        batch: &mut CommandBatch,
+        proj: &ProjectionKernels,
+        weight: MatrixHandle,
+        bias: usize,
+        input: &MetalBuffer,
+        scratch: &MetalBuffer,
+        output: &MetalBuffer,
+        tokens: u32,
+        epilogue: Epilogue,
+    ) -> crate::Result<()> {
+        let payload = &self.artifact.payload_buffer;
+        let (mat, _) = self.artifact.matrix_at(weight);
         if let AnyMatrix::Int4(m) = mat {
             self.kernels.int4_gemm_epilogue(
                 batch,
                 m,
-                (bias_buf, bias_off),
+                (payload, bias),
                 input,
                 output,
                 tokens,
@@ -744,7 +802,7 @@ impl VisionEncoder {
             self.kernels.bias_epilogue(
                 batch,
                 target,
-                (bias_buf, bias_off),
+                (payload, bias),
                 output,
                 mat.rows(),
                 tokens,
@@ -893,34 +951,30 @@ impl VisionEncoder {
             let _ = ane.stage_layer(&mut batch, &self.artifact, 0, 0)?;
         }
         for layer in 0..VISION_LAYERS {
-            let p = format!("model.vision_tower.encoder.layers.{layer}");
-            let (ln1_w, ln1_w_off, _) = self.artifact.f32_slice(&format!("{p}.layer_norm1.weight"))?;
-            let (ln1_b, ln1_b_off, _) = self.artifact.f32_slice(&format!("{p}.layer_norm1.bias"))?;
+            let lw = self.layer_weights[layer];
+            let payload = &self.artifact.payload_buffer;
             self.kernels.layernorm(
                 &mut batch,
                 &self.hidden,
-                (ln1_w, ln1_w_off),
-                (ln1_b, ln1_b_off),
+                (payload, lw.ln1_w),
+                (payload, lw.ln1_b),
                 &self.normed,
                 VISION_WIDTH,
                 count as u32,
                 VISION_EPSILON,
             );
-            let (qm, _) = self.artifact.matrix(&format!("{p}.self_attn.q_proj.weight"))?;
-            let (km, _) = self.artifact.matrix(&format!("{p}.self_attn.k_proj.weight"))?;
-            let (vm_mat, _) = self.artifact.matrix(&format!("{p}.self_attn.v_proj.weight"))?;
+            let (qm, _) = self.artifact.matrix_at(lw.q);
+            let (km, _) = self.artifact.matrix_at(lw.k);
+            let (vm_mat, _) = self.artifact.matrix_at(lw.v);
             if let (AnyMatrix::Int4(q4), AnyMatrix::Int4(k4), AnyMatrix::Int4(v4)) = (qm, km, vm_mat) {
-                let (bq, bq_off, _) = self.artifact.f32_slice(&format!("{p}.self_attn.q_proj.bias"))?;
-                let (bk, bk_off, _) = self.artifact.f32_slice(&format!("{p}.self_attn.k_proj.bias"))?;
-                let (bv, bv_off, _) = self.artifact.f32_slice(&format!("{p}.self_attn.v_proj.bias"))?;
                 self.kernels.int4_qkv_bias(
                     &mut batch,
                     q4,
-                    (bq, bq_off),
+                    (payload, lw.q_bias),
                     k4,
-                    (bk, bk_off),
+                    (payload, lw.k_bias),
                     v4,
-                    (bv, bv_off),
+                    (payload, lw.v_bias),
                     &self.normed,
                     &self.q,
                     &self.k,
@@ -929,12 +983,16 @@ impl VisionEncoder {
                 );
             } else {
                 // Not `independent`: each bias epilogue must see its own matmul's output.
-                for (name, out) in [("q", &self.q), ("k", &self.k), ("v", &self.v)] {
-                    self.project_linear(
+                for (handle, bias, out) in [
+                    (lw.q, lw.q_bias, &self.q),
+                    (lw.k, lw.k_bias, &self.k),
+                    (lw.v, lw.v_bias, &self.v),
+                ] {
+                    self.project_linear_resolved(
                         &mut batch,
                         proj,
-                        &format!("{p}.self_attn.{name}_proj.weight"),
-                        &format!("{p}.self_attn.{name}_proj.bias"),
+                        handle,
+                        bias,
                         &self.normed,
                         out,
                         out,
@@ -952,11 +1010,11 @@ impl VisionEncoder {
                 count as u32,
                 0,
             );
-            self.project_linear(
+            self.project_linear_resolved(
                 &mut batch,
                 proj,
-                &format!("{p}.self_attn.out_proj.weight"),
-                &format!("{p}.self_attn.out_proj.bias"),
+                lw.out,
+                lw.out_bias,
                 &self.attn_out,
                 &self.q,
                 &self.hidden,
@@ -965,13 +1023,11 @@ impl VisionEncoder {
             )?;
 
 
-            let (ln2_w, ln2_w_off, _) = self.artifact.f32_slice(&format!("{p}.layer_norm2.weight"))?;
-            let (ln2_b, ln2_b_off, _) = self.artifact.f32_slice(&format!("{p}.layer_norm2.bias"))?;
             self.kernels.layernorm(
                 &mut batch,
                 &self.hidden,
-                (ln2_w, ln2_w_off),
-                (ln2_b, ln2_b_off),
+                (payload, lw.ln2_w),
+                (payload, lw.ln2_b),
                 &self.normed,
                 VISION_WIDTH,
                 count as u32,
@@ -992,22 +1048,22 @@ impl VisionEncoder {
                 false
             };
             if !ran_mlp_on_ane {
-                self.project_linear(
+                self.project_linear_resolved(
                     &mut batch,
                     proj,
-                    &format!("{p}.mlp.fc1.weight"),
-                    &format!("{p}.mlp.fc1.bias"),
+                    lw.fc1,
+                    lw.fc1_bias,
                     &self.normed,
                     &self.ffn_mid,
                     &self.ffn_mid,
                     count as u32,
                     Epilogue::GeluTanh,
                 )?;
-                self.project_linear(
+                self.project_linear_resolved(
                     &mut batch,
                     proj,
-                    &format!("{p}.mlp.fc2.weight"),
-                    &format!("{p}.mlp.fc2.bias"),
+                    lw.fc2,
+                    lw.fc2_bias,
                     &self.ffn_mid,
                     &self.q,
                     &self.hidden,

@@ -197,6 +197,15 @@ impl SamplingKernels {
         slice[..rows].to_vec()
     }
 
+    /// Row 0 of the greedy output without the Vec the multi-row read builds — the plain
+    /// single-token decode path calls this once per generated token.
+    #[must_use]
+    #[expect(unsafe_code)]
+    pub fn read_greedy_row0(&self) -> GreedyRowResult {
+        let slice = unsafe { self.greedy_out.as_slice::<GreedyRowResult>() };
+        slice[0]
+    }
+
 
     pub fn encode_topk_rows(
         &self,

@@ -15,8 +15,9 @@
 //! merge values `[[u32; 2]; merges]` (`rank`, `merged id`); `[u32; added]` added-token ids.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::File;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -41,6 +42,10 @@ pub struct Tokenizer {
     added_at: usize,
     merges: usize,
     added: usize,
+    /// Cached `(offset, len, id)` of every added token's bytes and a first-byte -> index bucket
+    /// index, built once so `encode` does not re-derive both per call.
+    added_table: Vec<(usize, usize, u32)>,
+    added_buckets: BTreeMap<u8, Range<usize>>,
 }
 
 #[derive(Default)]
@@ -106,12 +111,42 @@ impl Tokenizer {
             added_at,
             merges,
             added,
+            added_table: Vec::new(),
+            added_buckets: BTreeMap::new(),
         };
         let offsets = tok.words(tok.offsets_at, tokens + 1);
         if offsets.windows(2).any(|w| w[0] > w[1]) || offsets[tokens] as usize > blob_len {
             return Err(bad());
         }
+        let mut tok = tok;
+        tok.build_added_table();
         Ok(tok)
+    }
+
+    /// Cache every added token's `(blob offset, byte length, id)` and bucket the entries by
+    /// first byte, so `encode`'s leftmost-longest scan touches only candidates that can match.
+    /// Within a bucket entries are longest-first, so the first `starts_with` hit is the longest
+    /// match.
+    fn build_added_table(&mut self) {
+        let map_start = self.map.as_ptr() as usize;
+        self.added_table = self
+            .words(self.added_at, self.added)
+            .iter()
+            .map(|&id| {
+                let bytes = self.token_bytes(id);
+                (bytes.as_ptr() as usize - map_start, bytes.len(), id)
+            })
+            .collect();
+        self.added_buckets.clear();
+        for (idx, (offset, len, _)) in self.added_table.iter().enumerate() {
+            if *len > 0 {
+                let b = self.map[*offset];
+                let entry = self.added_buckets.entry(b).or_insert(idx..idx);
+                entry.end = idx + 1;
+            }
+        }
+        self.added_table
+            .sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
     }
 
     fn words(&self, at: usize, len: usize) -> &[u32] {
@@ -143,21 +178,22 @@ impl Tokenizer {
 
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let added: Vec<(&[u8], u32)> = self
-            .words(self.added_at, self.added)
-            .iter()
-            .map(|&id| (self.token_bytes(id), id))
-            .collect();
         let mut ids = Vec::new();
         let mut rest = text;
-        // Leftmost-longest added-token match, like `tokenizers`' added vocabulary.
+        // Leftmost-longest added-token match, like `tokenizers`' added vocabulary: at each
+        // position, only the bucket of added tokens sharing the byte there can match, and the
+        // table is sorted longest-first within that bucket.
         while let Some((start, len, id)) = (0..rest.len()).find_map(|at| {
             let first = rest.as_bytes()[at];
-            added
-                .iter()
-                .filter(|(bytes, _)| bytes.first() == Some(&first) && rest.as_bytes()[at..].starts_with(bytes))
-                .max_by_key(|(bytes, _)| bytes.len())
-                .map(|&(bytes, id)| (at, bytes.len(), id))
+            self.added_buckets
+                .get(&first)
+                .and_then(|range| {
+                    let hay = rest.as_bytes();
+                    self.added_table[range.clone()].iter().find(|&(offset, len, _)| {
+                        hay[at..].get(..*len).is_some_and(|window| window == &self.map[*offset..*offset + *len])
+                    })
+                })
+                .map(|&(_, len, id)| (at, len, id))
         }) {
             let (head, tail) = rest.split_at(start);
             self.encode_plain(head, &mut ids);

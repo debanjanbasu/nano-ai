@@ -100,7 +100,7 @@ fn run(
     let open_ms = start.elapsed().as_secs_f64() * 1e3;
     let before = memory();
     let run_start = Instant::now();
-    let report = if let Some(image) = image {
+    let generated = if let Some(image) = image {
         let bytes = std::fs::read(Path::new(model_dir).join(image))?;
         engine.generate_multimodal(
             &bytes,
@@ -113,10 +113,7 @@ fn run(
         let ids = engine.encode_text(&NanoEngine::format_chat_prompt(prompt))?;
         engine.generate_ids(&ids, max_tokens, SamplingParams::default())?
     };
-    let mut report = serde_json::to_value(report)?;
-    if let Some(fields) = report.as_object_mut() {
-        fields.remove("token_ids");
-    }
+    let report = serde_json::to_value(generated)?;
     Ok(serde_json::json!({
         "device": engine.device_name(),
         "ane": engine.ane_status(),

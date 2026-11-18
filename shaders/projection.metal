@@ -181,38 +181,6 @@ kernel void int8_matmul_wide(
     }
 }
 
-kernel void int8_matvec_concat(
-    device const char *weights0 [[buffer(0)]], device const float *scales0 [[buffer(1)]],
-    device float *output0 [[buffer(2)]],
-    device const char *weights1 [[buffer(3)]], device const float *scales1 [[buffer(4)]],
-    device float *output1 [[buffer(5)]],
-    device const char *weights2 [[buffer(6)]], device const float *scales2 [[buffer(7)]],
-    device float *output2 [[buffer(8)]],
-    device const float *input [[buffer(9)]],
-    constant uint *segment_rows [[buffer(10)]], constant uint &columns [[buffer(11)]],
-    uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
-) {
-    const uint groups0 = (segment_rows[0] + 3) / 4, groups1 = (segment_rows[1] + 3) / 4;
-    device const char *weights = weights0;
-    device const float *scales = scales0;
-    device float *output = output0;
-    uint rows = segment_rows[0];
-    if (group >= groups0 + groups1) {
-        group -= groups0 + groups1;
-        weights = weights2;
-        scales = scales2;
-        output = output2;
-        rows = segment_rows[2];
-    } else if (group >= groups0) {
-        group -= groups0;
-        weights = weights1;
-        scales = scales1;
-        output = output1;
-        rows = segment_rows[1];
-    }
-    int8_matmul_rows<4, 1>(weights, scales, input, output, rows, columns, group, lane);
-}
-
 kernel void int8_matvec_swiglu(
     device const char *gate [[buffer(0)]], device const float *gate_scales [[buffer(1)]],
     device const char *up [[buffer(2)]], device const float *up_scales [[buffer(3)]],

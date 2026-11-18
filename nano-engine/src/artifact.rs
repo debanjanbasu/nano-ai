@@ -154,7 +154,9 @@ fn par_each<T: Send>(jobs: Vec<T>, work: impl Fn(T) + Sync) {
 #[derive(Clone)]
 pub struct MappedArtifact {
     map: Arc<Mmap>,
-    pub header: ArtifactHeader,
+    /// Shared with every `MappedArtifact::clone()` (`DsparkDrafter`, `VisionEncoder`): cloning
+    /// no longer copies the 842-entry tensor table and JSON config.
+    pub header: Arc<ArtifactHeader>,
     pub payload_buffer: MetalBuffer,
 }
 
@@ -919,7 +921,7 @@ impl MappedArtifact {
             unsafe { MetalBuffer::from_bytes_no_copy(ctx.device(), ptr, payload.len(), owner)? };
         let artifact = Self {
             map,
-            header,
+            header: Arc::new(header),
             payload_buffer,
         };
         artifact.prefetch();

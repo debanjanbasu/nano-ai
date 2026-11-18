@@ -20,7 +20,7 @@ use nano_metal::ops::{
     MODEL_WIDTH, NanoOps, Rope,
 };
 use nano_metal::projection::{AnyMatrix, ProjectionKernels, SignedHadamard512};
-use nano_metal::sampling::SamplingKernels;
+use nano_metal::sampling::{GreedyRowResult, SamplingKernels};
 use nano_metal::shaders::ShaderLibrary;
 use serde::Serialize;
 use crate::tokenizer::Tokenizer;
@@ -113,6 +113,9 @@ pub struct GenerationReport {
     pub prompt_tokens: usize,
     pub cached_prefix_tokens: usize,
     pub generated_tokens: usize,
+    /// Generated ids; only `tests.rs` compares them. Not serialized (the CLI, the server and
+    /// `nano-ios` never use it) to keep long reports small.
+    #[cfg_attr(not(test), serde(skip))]
     pub token_ids: Vec<u32>,
     pub prefill_ms: f64,
     pub decode_ms: f64,
@@ -231,6 +234,8 @@ struct LayerWeights {
     gate: MatrixHandle,
     up: MatrixHandle,
     down: MatrixHandle,
+    /// This layer's `DSpark` tap slot (index into `DSPARK_TAPS`), precomputed.
+    tap_slot: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +295,10 @@ impl LayerWeights {
             gate: m("mlp.gate_proj.weight")?,
             up: m("mlp.up_proj.weight")?,
             down: m("mlp.down_proj.weight")?,
+            tap_slot: DSPARK_TAPS
+                .iter()
+                .position(|&l| l == layer)
+                .map(|idx| idx as u32),
         })
     }
 }
@@ -1090,6 +1099,9 @@ impl NanoEngine {
         prog: &nano_metal::ane::Program,
     ) -> crate::Result<Result<Box<AneFfnOffload>, String>> {
         let mut offload = AneFfnOffload::new(&self.ctx, &self.shaders, prog)?;
+        if !offload.resolve_ffn_handles(&self.artifact)? {
+            return Ok(Err("an FFN layer is not three INT4_G64 matrices".into()));
+        }
         let (_, tol) = check_rows_and_tolerance();
         let rows = self.profile.prefill_rows.min(ANE_MAX_ROWS);
         unsafe {
@@ -1275,28 +1287,6 @@ impl NanoEngine {
             scores,
             top_pieces,
         })
-    }
-
-    /// Execute `agent_prompts` sharing a common `system_prompt` with automatic GPU `PrefixCache` reuse.
-    #[expect(clippy::needless_pass_by_value)]
-    pub fn run_agents(
-        &mut self,
-        system_prompt: &str,
-        agent_prompts: &[String],
-        max_new_tokens: usize,
-        params: SamplingParams,
-    ) -> crate::Result<Vec<GenerationReport>> {
-        if agent_prompts.len() > 1 {
-            let shared_prefix = format!("<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n");
-            let _ = self.warm_prefix_cache(&shared_prefix);
-        }
-        let mut reports = Vec::with_capacity(agent_prompts.len());
-        for agent_prompt in agent_prompts {
-            let formatted = Self::format_chat_prompt_with_system(system_prompt, agent_prompt);
-            let ids = self.encode_text(&formatted)?;
-            reports.push(self.generate_ids(&ids, max_new_tokens, params.clone())?);
-        }
-        Ok(reports)
     }
 
     pub fn encode_text(&self, text: &str) -> crate::Result<Vec<u32>> {
@@ -1925,14 +1915,7 @@ impl NanoEngine {
                     tokens_u32,
                 )?;
             }
-            let tap_slot = if self.drafter.is_some() {
-                DSPARK_TAPS
-                    .iter()
-                    .position(|&l| l == layer)
-                    .map(|idx| idx as u32)
-            } else {
-                None
-            };
+            let tap_slot = self.drafter.is_some().then_some(lw.tap_slot).flatten();
             if layer + 1 < LAYERS && ane_offload.is_none() {
                 let (next_norm, next_off) = (payload, self.layers[layer + 1].input_norm);
                 self.ops.residual_add_rms_tap(
@@ -2161,6 +2144,77 @@ impl NanoEngine {
     ) -> crate::Result<GenerationReport> {
         self.generate_ids_streaming(prompt_ids, max_new_tokens, params, |_| {})
     }
+    /// Read sampled row `row` of the batch: greedy rows when `greedy_rows` is `Some` (its `row`
+    /// entry), else the row's top-k candidates through `sampler`. Returns the pick and the step's
+    /// RPDI entropy, `exp(-margin / 2)` from the top-2 logit margin (4.0 when unknown).
+    fn sample_row(
+        &self,
+        sampler: &mut Sampler,
+        row: usize,
+        greedy_rows: Option<&[GreedyRowResult]>,
+    ) -> (u32, f32) {
+        greedy_rows.map_or_else(
+            || {
+                let cands = self.sampling.read_topk_row(row, sampler.active_top_k());
+                let margin = if cands.len() >= 2 {
+                    (cands[0].logit - cands[1].logit).max(0.0)
+                } else {
+                    4.0
+                };
+                (sampler.select_from_candidates(cands).token_id, (-0.5 * margin).exp())
+            },
+            |rows| {
+                let r = &rows[row];
+                let margin = (r.best_logit - r.second_logit).max(0.0);
+                (r.best_id, (-0.5 * margin).exp())
+            },
+        )
+    }
+
+    /// Fold one step's entropy into the RPDI accumulators (`think` still open and the pick is
+    /// not the think-end token): global and 32-step sliding-window local sums, plus the window.
+    fn fold_step_entropy(
+        think_entropies: &mut Vec<f32>,
+        global_ent_sum: &mut f32,
+        local_ent_sum: &mut f32,
+        rpdi_window: usize,
+        step_ent: f32,
+    ) {
+        *global_ent_sum += step_ent;
+        *local_ent_sum += step_ent;
+        if think_entropies.len() >= rpdi_window {
+            *local_ent_sum -= think_entropies[think_entropies.len() - rpdi_window];
+        }
+        think_entropies.push(step_ent);
+    }
+
+    /// Whether the DRY scratch shows a repeating n-gram (a tagged row with weight >= 32) deep
+    /// enough into generation to saturate RPDI.
+    #[must_use]
+    fn dry_scratch_has_loop(&self) -> bool {
+        self.dry_scratch
+            .iter()
+            .any(|&[t, w]| (t >> 24) < 0x80 && w >= 32)
+    }
+
+    /// Push the dynamic think-end boost once RPDI has saturated: `THINK_END_ID` after `prev_tok`
+    /// scores better the longer the loop has run, breaking reasoning loops. Line-break tokens
+    /// triple the boost.
+    fn push_think_end_boost(&mut self, row: u32, prev_tok: u32, generated_len: usize) {
+        if self.dry_scratch.len() >= 1024 {
+            return;
+        }
+        let excess = generated_len.saturating_sub(128);
+        let base_boost = (80 + excess * 3).min(300) as u32;
+        let mult = if matches!(prev_tok, 13 | 198 | 271 | 624 | 382) {
+            3
+        } else {
+            1
+        };
+        let tagged = (0x80_u32 | row) << 24 | THINK_END_ID;
+        self.dry_scratch.push([tagged, (base_boost * mult).min(500)]);
+    }
+
     fn record_recent_token(&mut self, token_id: u32, weight: u32) {
         let tagged = 0xFF00_0000 | (token_id & 0x00FF_FFFF);
         if let Some(entry) = self
@@ -2249,42 +2303,24 @@ impl NanoEngine {
         &self.dry_scratch
     }
 
-    pub fn generate_ids_streaming(
-        &mut self,
-        prompt_ids: &[u32],
-        max_new_tokens: usize,
-        params: SamplingParams,
-        mut on_piece: impl FnMut(&str),
-    ) -> crate::Result<GenerationReport> {
-        if prompt_ids.is_empty() {
-            return Err(Error::InvalidArgument("prompt_ids cannot be empty".into()));
-        }
-        let mut sampler = Sampler::new(params);
-
-        // 1. Restore longest matching prefix checkpoint (or zero-copy resident continuation),
-        // then prefill remaining tokens in chunks with automatic milestone checkpointing.
-        let t_prefill_start = Instant::now();
-        let lcp_with_resident = if self.prefix_cache_enabled {
-            self.active_tokens
+    /// Checkpoint boundaries to stop prefill at: the longest resident-prefix LCP, the system
+    /// turn's end (agents resend it), and — for short prompts — the final row. Each is `(row,
+    /// pinned)`; `pinned` checkpoints survive eviction.
+    fn prefill_milestones(&self, prompt_ids: &[u32]) -> Vec<(usize, bool)> {
+        let mut milestones = Vec::with_capacity(3);
+        if self.prefix_cache_enabled {
+            let lcp_with_resident = self
+                .active_tokens
                 .iter()
                 .zip(prompt_ids)
                 .take_while(|(a, b)| a == b)
                 .count()
-                .min(prompt_ids.len().saturating_sub(1))
-        } else {
-            0
-        };
-        let mut reused = self.restore_or_advance_prefix(prompt_ids)?;
-        let mut milestones = Vec::with_capacity(3);
-        if self.prefix_cache_enabled {
+                .min(prompt_ids.len().saturating_sub(1));
             if lcp_with_resident >= 8 && lcp_with_resident < prompt_ids.len() {
                 milestones.push((lcp_with_resident, true));
             }
             // The first turn's end (the system prompt, however long) is the prefix agents resend.
-            if let Some(pos) = prompt_ids
-                .iter()
-                .position(|&id| id == IM_END_ID)
-            {
+            if let Some(pos) = prompt_ids.iter().position(|&id| id == IM_END_ID) {
                 let se = if prompt_ids.get(pos + 1) == Some(&NEWLINE_ID) {
                     pos + 2
                 } else {
@@ -2300,78 +2336,22 @@ impl NanoEngine {
             milestones.sort_by_key(|&(pos, _)| pos);
             milestones.dedup_by_key(|m| m.0);
         }
-        let mut start = reused;
-        while start < prompt_ids.len() {
-            let mut end = (start + self.profile.prefill_rows).min(prompt_ids.len());
-            let mut hit_milestone = None;
-            for &(m_pos, pinned) in &milestones {
-                if m_pos > start
-                    && m_pos < end
-                    && !self
-                        .prefix_cache
-                        .iter()
-                        .any(|ckpt| ckpt.tokens == prompt_ids[..m_pos])
-                {
-                    end = m_pos;
-                    hit_milestone = Some((m_pos, pinned));
-                    break;
-                }
-            }
-            let chunk = &prompt_ids[start..end];
-            let is_last = end == prompt_ids.len();
-            self.dry_scratch.clear();
-            match self.forward_step(
-                Some(chunk),
-                chunk.len(),
-                Rope::Text(self.rope_delta),
-                false,
-                usize::from(is_last),
-                if is_last { sampler.active_top_k() } else { 0 },
-            ) {
-                Ok(()) => {}
-                // The ANE failed (now off) and the engine was reset: prefill it all again on the GPU.
-                Err(Error::AneFailed) => {
-                    (start, reused) = (0, 0);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-            self.position += chunk.len();
-            self.active_tokens.extend_from_slice(chunk);
-            if let Some((m_pos, pinned)) = hit_milestone
-                && !is_last
-            {
-                // Best-effort: a checkpoint that cannot be made only costs a later prefill.
-                let _ = self.save_prefix_checkpoint(&prompt_ids[..m_pos], pinned);
-            }
-            start = end;
-        }
-        self.decode_from_prefilled_logits(
-            prompt_ids,
-            reused,
-            t_prefill_start.elapsed().as_secs_f64() * 1000.0,
-            max_new_tokens,
-            &mut sampler,
-            &mut on_piece,
-        )
+        milestones
     }
 
-    fn decode_from_prefilled_logits(
+    pub fn generate_ids_streaming(
         &mut self,
         prompt_ids: &[u32],
-        cached_prefix_tokens: usize,
-        prefill_ms: f64,
         max_new_tokens: usize,
-        sampler: &mut Sampler,
-        on_piece: &mut impl FnMut(&str),
+        params: SamplingParams,
+        on_piece: impl FnMut(&str),
     ) -> crate::Result<GenerationReport> {
-        block_on_future(self.decode_from_prefilled_logits_async_stoppable(
+        let mut on_piece = Some(on_piece);
+        block_on_future(self.generate_ids_streaming_async_stoppable(
             prompt_ids,
-            cached_prefix_tokens,
-            prefill_ms,
             max_new_tokens,
-            sampler,
-            on_piece,
+            params,
+            |piece| if let Some(f) = &mut on_piece { f(piece) },
             || false,
         ))
     }
@@ -2389,7 +2369,6 @@ impl NanoEngine {
         self.generate_multimodal_streaming(image_bytes, prompt, mode, max_new_tokens, params, |_| {})
     }
 
-    #[expect(unsafe_code)]
     pub fn generate_multimodal_streaming(
         &mut self,
         image_bytes: &[u8],
@@ -2397,43 +2376,37 @@ impl NanoEngine {
         mode: DownsampleMode,
         max_new_tokens: usize,
         params: SamplingParams,
-        mut on_piece: impl FnMut(&str),
+        on_piece: impl FnMut(&str),
     ) -> crate::Result<GenerationReport> {
-        let prep = PreparedImage::from_bytes(image_bytes, 36)?;
-        let mut crop_embeds = Vec::new();
-        if self.vision.is_none() {
-            if self
-                .artifact
-                .header
-                .tensors
-                .contains_key("model.vision_tower.embeddings.patch_embedding.weight")
-            {
-                self.vision = Some(VisionEncoder::from_artifact(
-                    &self.ctx,
-                    &self.shaders,
-                    self.artifact.clone(),
-                )?);
-            } else if let Some(vp) = self.vision_path.clone() {
-                self.load_vision(&vp)?;
-            }
-        }
-        {
-            let vis = self
-                .vision
-                .as_mut()
-                .ok_or_else(|| Error::InvalidArgument("vision tower not loaded".into()))?;
-            crop_embeds.push(vis.encode_crop(&self.ctx, &self.shaders, &self.proj, &prep.overview, mode)?);
-            for s in &prep.slices {
-                crop_embeds.push(vis.encode_crop(&self.ctx, &self.shaders, &self.proj, s, mode)?);
-            }
-        }
-        if !self.profile.keep_vision {
-            self.vision = None;
-        }
-        let flat_img_embeds: Vec<f32> = crop_embeds.into_iter().flatten().collect();
+        let mut on_piece = Some(on_piece);
+        let report = block_on_future(self.generate_multimodal_streaming_async_stoppable(
+            image_bytes,
+            prompt,
+            mode,
+            max_new_tokens,
+            params,
+            |piece| if let Some(f) = &mut on_piece { f(piece) },
+            || false,
+        ))?;
+        self.active_tokens.clear();
+        self.rope_delta = 0;
+        self.position = 0;
+        Ok(report)
+    }
 
-        // Build token sequence: `<|im_start|>user\n<image_id>0</image_id><image>[pads]</image>[slices]\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`
-        let mut prompt_ids = self.encode_text(&format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n", Self::DEFAULT_SYSTEM_PROMPT))?;
+    /// Build the multimodal token sequence for `prep` + `prompt` and its Canvas 3D M-RoPE
+    /// positions: the standard chat template with `<image_id>0</image_id>` + overview pads,
+    /// one `\n`-separated grid of slice pads, then the prompt and the open think block.
+    fn build_multimodal_prompt(
+        &self,
+        prep: &PreparedImage,
+        prompt: &str,
+        mode: DownsampleMode,
+    ) -> crate::Result<(Vec<u32>, Vec<[u32; 4]>, i32)> {
+        let mut prompt_ids = self.encode_text(&format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n",
+            Self::DEFAULT_SYSTEM_PROMPT
+        ))?;
         let zero_ids = self.encode_text("0")?;
         prompt_ids.push(IMAGE_ID_START);
         prompt_ids.extend_from_slice(&zero_ids);
@@ -2463,59 +2436,30 @@ impl NanoEngine {
 
         let target_sizes = prep.target_sizes();
         let (pos3d, rope_delta) = compute_canvas_mrope(&prompt_ids, &target_sizes, mode);
-        self.reset();
-        self.rope_delta = rope_delta;
+        Ok((prompt_ids, pos3d, rope_delta))
+    }
 
-        // Prefill multimodal prompt with Canvas 3D M-RoPE positions and scattered image features
-        let t_prefill_start = Instant::now();
-        let mut img_feat_cursor = 0_usize;
-        let mut start = 0;
-        let mut sampler = Sampler::new(params);
-        while start < prompt_ids.len() {
-            let end = (start + self.profile.prefill_rows).min(prompt_ids.len());
-            let chunk = &prompt_ids[start..end];
-            let is_last = end == prompt_ids.len();
-            self.embed_tokens_into_hidden(chunk)?;
-            unsafe {
-                let h_slice = &mut self.hidden.as_mut_slice::<f32>()[..chunk.len() * WIDTH];
-                for (t, &id) in chunk.iter().enumerate() {
-                    if id == IMAGE_TOKEN_ID
-                        && img_feat_cursor + WIDTH <= flat_img_embeds.len()
-                    {
-                        h_slice[t * WIDTH..(t + 1) * WIDTH].copy_from_slice(
-                            &flat_img_embeds[img_feat_cursor..img_feat_cursor + WIDTH],
-                        );
-                        img_feat_cursor += WIDTH;
-                    }
-                }
-                let r_slice = &mut self.rope_rows_buf.as_mut_slice::<[u32; 4]>()[..chunk.len()];
-                r_slice.copy_from_slice(&pos3d[start..end]);
-            }
-            let rope_buf = self.rope_rows_buf.clone();
-            self.dry_scratch.clear();
-            self.forward_step(
-                None,
-                chunk.len(),
-                Rope::Canvas(&rope_buf, 0),
-                false,
-                usize::from(is_last),
-                if is_last { sampler.active_top_k() } else { 0 },
-            )?;
-            self.position += chunk.len();
-            start = end;
+    /// Attach the vision tower on first use: the fused artifact carries it, else the sibling
+    /// `minicpm-v-4.7-1b-vision.bin`.
+    fn ensure_vision_tower(&mut self) -> crate::Result<()> {
+        if self.vision.is_some() {
+            return Ok(());
         }
-        let report = self.decode_from_prefilled_logits(
-            &prompt_ids,
-            0,
-            t_prefill_start.elapsed().as_secs_f64() * 1000.0,
-            max_new_tokens,
-            &mut sampler,
-            &mut on_piece,
-        );
-        self.active_tokens.clear();
-        self.rope_delta = 0;
-        self.position = 0;
-        report
+        if self
+            .artifact
+            .header
+            .tensors
+            .contains_key("model.vision_tower.embeddings.patch_embedding.weight")
+        {
+            self.vision = Some(VisionEncoder::from_artifact(
+                &self.ctx,
+                &self.shaders,
+                self.artifact.clone(),
+            )?);
+        } else if let Some(vp) = self.vision_path.clone() {
+            self.load_vision(&vp)?;
+        }
+        Ok(())
     }
 
     /// Asynchronously prefill and decode `prompt_ids`, awaiting GPU completion through Metal 4
@@ -2550,42 +2494,10 @@ impl NanoEngine {
         }
         let mut sampler = Sampler::new(params);
         let t_prefill_start = Instant::now();
-        let lcp_with_resident = if self.prefix_cache_enabled {
-            self.active_tokens
-                .iter()
-                .zip(prompt_ids)
-                .take_while(|(a, b)| a == b)
-                .count()
-                .min(prompt_ids.len().saturating_sub(1))
-        } else {
-            0
-        };
+        // Restore longest matching prefix checkpoint (or zero-copy resident continuation), then
+        // prefill remaining tokens in chunks with automatic milestone checkpointing.
         let mut reused = self.restore_or_advance_prefix(prompt_ids)?;
-        let mut milestones = Vec::with_capacity(3);
-        if self.prefix_cache_enabled {
-            if lcp_with_resident >= 8 && lcp_with_resident < prompt_ids.len() {
-                milestones.push((lcp_with_resident, true));
-            }
-            // The first turn's end (the system prompt, however long) is the prefix agents resend.
-            if let Some(pos) = prompt_ids
-                .iter()
-                .position(|&id| id == IM_END_ID)
-            {
-                let se = if prompt_ids.get(pos + 1) == Some(&NEWLINE_ID) {
-                    pos + 2
-                } else {
-                    pos + 1
-                };
-                if se >= 8 && se < prompt_ids.len() {
-                    milestones.push((se, true));
-                }
-            }
-            if prompt_ids.len() >= 32 && prompt_ids.len() <= ANE_MIN_ROWS {
-                milestones.push((prompt_ids.len() - 1, false));
-            }
-            milestones.sort_by_key(|&(pos, _)| pos);
-            milestones.dedup_by_key(|m| m.0);
-        }
+        let milestones = self.prefill_milestones(prompt_ids);
         let mut start = reused;
         while start < prompt_ids.len() {
             let mut end = (start + self.profile.prefill_rows).min(prompt_ids.len());
@@ -2691,13 +2603,13 @@ impl NanoEngine {
             };
             fut.await?;
             if first_top_k == 1 {
-                let token_id = self.sampling.read_greedy_rows(1)[0].best_id;
+                let token_id = self.sampling.read_greedy_row0().best_id;
                 crate::sampler::SamplingResult { token_id, is_eos: sampler.is_eos(token_id) }
             } else {
                 sampler.select_from_candidates(self.sampling.read_topk_row(0, first_top_k))
             }
         } else if first_top_k == 1 {
-            let token_id = self.sampling.read_greedy_rows(1)[0].best_id;
+            let token_id = self.sampling.read_greedy_row0().best_id;
             crate::sampler::SamplingResult { token_id, is_eos: sampler.is_eos(token_id) }
         } else {
             sampler.select_from_candidates(self.sampling.read_topk_row(0, first_top_k))
@@ -2749,6 +2661,9 @@ impl NanoEngine {
         let mut local_ent_sum = 0.0_f32;
         let mut rpdi_saturated = false;
         let rpdi_window = 32_usize;
+        // Reused `[anchor, drafts...]` verify-block buffer; `MAX_VERIFY_TOKENS + 1` rows is the
+        // longest block a round can encode.
+        let mut verify_block = Vec::with_capacity(MAX_VERIFY_TOKENS + 1);
 
         while generated.len() < max_new_tokens && !should_stop() {
             if !closed_thinking
@@ -2866,51 +2781,37 @@ impl NanoEngine {
                 speculative_rounds += 1;
                 let draft_count = drafts.len();
                 drafted_tokens += draft_count;
-                let mut block = Vec::with_capacity(1 + draft_count);
-                block.push(anchor);
-                block.extend_from_slice(&drafts);
+                let block = {
+                    verify_block.clear();
+                    verify_block.push(anchor);
+                    verify_block.extend_from_slice(&drafts);
+                    &*verify_block
+                };
 
                 let top_k = sampler.active_top_k();
                 let verify_ms = if pre_verified {
-                    if !closed_thinking {
-                        let has_loop = self
-                            .dry_scratch
-                            .iter()
-                            .any(|&[t, w]| (t >> 24) < 0x80 && w >= 32);
-                        if has_loop && generated.len() >= 64 {
-                            rpdi_saturated = true;
-                        }
+                    if !closed_thinking
+                        && self.dry_scratch_has_loop()
+                        && generated.len() >= 64
+                    {
+                        rpdi_saturated = true;
                     }
                     0.0
                 } else {
-                    self.build_dry_penalties(&history, &block, !closed_thinking, prompt_len);
+                    self.build_dry_penalties(&history, block, !closed_thinking, prompt_len);
                     if !closed_thinking {
-                        let has_loop = self
-                            .dry_scratch
-                            .iter()
-                            .any(|&[t, w]| (t >> 24) < 0x80 && w >= 32);
-                        if has_loop && generated.len() >= 64 {
+                        if self.dry_scratch_has_loop() && generated.len() >= 64 {
                             rpdi_saturated = true;
                         }
                         if rpdi_saturated && generated.len() >= 128 {
-                            let excess = generated.len().saturating_sub(128);
-                            let base_boost = (80 + excess * 3).min(300) as u32;
                             for (r, &prev_tok) in block.iter().enumerate() {
-                                let mult = if matches!(prev_tok, 13 | 198 | 271 | 624 | 382) {
-                                    3
-                                } else {
-                                    1
-                                };
-                                if self.dry_scratch.len() < 1024 {
-                                    let tagged = (0x80_u32 | (r as u32)) << 24 | THINK_END_ID;
-                                    self.dry_scratch.push([tagged, (base_boost * mult).min(500)]);
-                                }
+                                self.push_think_end_boost(r as u32, prev_tok, generated.len());
                             }
                         }
                     }
                     let t_verify = Instant::now();
                     self.forward_step_async(
-                        Some(&block),
+                        Some(block),
                         block.len(),
                         Rope::Text(self.rope_delta),
                         true,
@@ -2925,25 +2826,15 @@ impl NanoEngine {
                 let mut accepted = 0_usize;
                 let mut hit_eos = false;
                 for i in 0..draft_count {
-                    let (target_pick, step_ent) = if let Some(rows) = &greedy_rows {
-                        let margin = (rows[i].best_logit - rows[i].second_logit).max(0.0);
-                        (rows[i].best_id, (-0.5 * margin).exp())
-                    } else {
-                        let cands = self.sampling.read_topk_row(i, top_k);
-                        let margin = if cands.len() >= 2 {
-                            (cands[0].logit - cands[1].logit).max(0.0)
-                        } else {
-                            4.0
-                        };
-                        (sampler.select_from_candidates(cands).token_id, (-0.5 * margin).exp())
-                    };
+                    let (target_pick, step_ent) = self.sample_row(sampler, i, greedy_rows.as_deref());
                     if !closed_thinking && target_pick != THINK_END_ID {
-                        global_ent_sum += step_ent;
-                        local_ent_sum += step_ent;
-                        if think_entropies.len() >= rpdi_window {
-                            local_ent_sum -= think_entropies[think_entropies.len() - rpdi_window];
-                        }
-                        think_entropies.push(step_ent);
+                        Self::fold_step_entropy(
+                            &mut think_entropies,
+                            &mut global_ent_sum,
+                            &mut local_ent_sum,
+                            rpdi_window,
+                            step_ent,
+                        );
                     }
                     if target_pick == drafts[i] {
                         accepted += 1;
@@ -2981,26 +2872,16 @@ impl NanoEngine {
                     }
                 }
                 if !hit_eos && accepted == draft_count && generated.len() < max_new_tokens {
-                    let (bonus, bonus_ent) = if let Some(rows) = &greedy_rows {
-                        let r = rows[draft_count];
-                        let margin = (r.best_logit - r.second_logit).max(0.0);
-                        (r.best_id, (-0.5 * margin).exp())
-                    } else {
-                        let cands = self.sampling.read_topk_row(draft_count, top_k);
-                        let margin = if cands.len() >= 2 {
-                            (cands[0].logit - cands[1].logit).max(0.0)
-                        } else {
-                            4.0
-                        };
-                        (sampler.select_from_candidates(cands).token_id, (-0.5 * margin).exp())
-                    };
+                    let (bonus, bonus_ent) =
+                        self.sample_row(sampler, draft_count, greedy_rows.as_deref());
                     if !closed_thinking && bonus != THINK_END_ID {
-                        global_ent_sum += bonus_ent;
-                        local_ent_sum += bonus_ent;
-                        if think_entropies.len() >= rpdi_window {
-                            local_ent_sum -= think_entropies[think_entropies.len() - rpdi_window];
-                        }
-                        think_entropies.push(bonus_ent);
+                        Self::fold_step_entropy(
+                            &mut think_entropies,
+                            &mut global_ent_sum,
+                            &mut local_ent_sum,
+                            rpdi_window,
+                            bonus_ent,
+                        );
                     }
                     generated.push(bonus);
                     history.push(bonus);
@@ -3123,8 +3004,10 @@ impl NanoEngine {
                                     self.encode_embed_gather(&mut batch, drafter.draft_tokens(), rows);
                                 }
                             } else {
-                                let block: Vec<u32> = std::iter::once(next_anchor).chain(ng_cpu.iter().copied()).collect();
-                                self.encode_embed_tokens(&mut batch, &block);
+                                verify_block.clear();
+                                verify_block.push(next_anchor);
+                                verify_block.extend_from_slice(&ng_cpu);
+                                self.encode_embed_tokens(&mut batch, &verify_block);
                             }
                             let (verify_batch, _) = self.encode_forward_step(
                                 Some(batch),
@@ -3177,23 +3060,11 @@ impl NanoEngine {
             let top_k = sampler.active_top_k();
             self.build_dry_penalties(&history, &[anchor], !closed_thinking, prompt_len);
             if !closed_thinking {
-                let has_loop = self
-                    .dry_scratch
-                    .iter()
-                    .any(|&[t, w]| (t >> 24) < 0x80 && w >= 32);
-                if has_loop && generated.len() >= 64 {
+                if self.dry_scratch_has_loop() && generated.len() >= 64 {
                     rpdi_saturated = true;
                 }
-                if rpdi_saturated && generated.len() >= 128 && self.dry_scratch.len() < 1024 {
-                    let excess = generated.len().saturating_sub(128);
-                    let base_boost = (80 + excess * 3).min(300) as u32;
-                    let mult = if matches!(anchor, 13 | 198 | 271 | 624 | 382) {
-                        3
-                    } else {
-                        1
-                    };
-                    let tagged = (0x80_u32 << 24) | THINK_END_ID;
-                    self.dry_scratch.push([tagged, (base_boost * mult).min(500)]);
+                if rpdi_saturated && generated.len() >= 128 {
+                    self.push_think_end_boost(0, anchor, generated.len());
                 }
             }
             self.forward_step_async(
@@ -3206,40 +3077,30 @@ impl NanoEngine {
             )
             .await?;
             self.position += 1;
-            let (next, step_ent) = if top_k == 1 {
-                let sel = self.sampling.read_greedy_rows(1)[0];
-                let margin = (sel.best_logit - sel.second_logit).max(0.0);
-                (
-                    crate::sampler::SamplingResult {
-                        token_id: sel.best_id,
-                        is_eos: sampler.is_eos(sel.best_id),
-                    },
-                    (-0.5 * margin).exp(),
-                )
+            let (next_id, step_ent) = if top_k == 1 {
+                let r = self.sampling.read_greedy_row0();
+                let margin = (r.best_logit - r.second_logit).max(0.0);
+                (r.best_id, (-0.5 * margin).exp())
             } else {
-                let cands = self.sampling.read_topk_row(0, top_k);
-                let margin = if cands.len() >= 2 {
-                    (cands[0].logit - cands[1].logit).max(0.0)
-                } else {
-                    4.0
-                };
-                (sampler.select_from_candidates(cands), (-0.5 * margin).exp())
+                self.sample_row(sampler, 0, None)
             };
-            if !closed_thinking && next.token_id != THINK_END_ID {
-                global_ent_sum += step_ent;
-                local_ent_sum += step_ent;
-                if think_entropies.len() >= rpdi_window {
-                    local_ent_sum -= think_entropies[think_entropies.len() - rpdi_window];
-                }
-                think_entropies.push(step_ent);
+            let next_is_eos = sampler.is_eos(next_id);
+            if !closed_thinking && next_id != THINK_END_ID {
+                Self::fold_step_entropy(
+                    &mut think_entropies,
+                    &mut global_ent_sum,
+                    &mut local_ent_sum,
+                    rpdi_window,
+                    step_ent,
+                );
             }
-            generated.push(next.token_id);
-            history.push(next.token_id);
-            self.record_recent_token(next.token_id, 1);
-            if next.is_eos {
+            generated.push(next_id);
+            history.push(next_id);
+            self.record_recent_token(next_id, 1);
+            if next_is_eos {
                 break;
             }
-            if let Some(piece) = self.stream_token_piece(&mut stream_state, next.token_id) {
+            if let Some(piece) = self.stream_token_piece(&mut stream_state, next_id) {
                 on_piece(&piece);
                 if should_stop() {
                     break;
@@ -3311,23 +3172,8 @@ impl NanoEngine {
         let prep = tokio::task::spawn_blocking(move || PreparedImage::from_bytes(&owned_bytes, 36))
             .await
             .map_err(|e| Error::InvalidArgument(format!("image prep join failed: {e}")))??;
+        self.ensure_vision_tower()?;
         let mut crop_embeds = Vec::new();
-        if self.vision.is_none() {
-            if self
-                .artifact
-                .header
-                .tensors
-                .contains_key("model.vision_tower.embeddings.patch_embedding.weight")
-            {
-                self.vision = Some(VisionEncoder::from_artifact(
-                    &self.ctx,
-                    &self.shaders,
-                    self.artifact.clone(),
-                )?);
-            } else if let Some(vp) = self.vision_path.clone() {
-                self.load_vision(&vp)?;
-            }
-        }
         {
             let vis = self
                 .vision
@@ -3349,39 +3195,12 @@ impl NanoEngine {
         }
         let flat_img_embeds: Vec<f32> = crop_embeds.into_iter().flatten().collect();
 
-        let mut prompt_ids = self.encode_text(&format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n", Self::DEFAULT_SYSTEM_PROMPT))?;
-        let zero_ids = self.encode_text("0")?;
-        prompt_ids.push(IMAGE_ID_START);
-        prompt_ids.extend_from_slice(&zero_ids);
-        prompt_ids.push(IMAGE_ID_END);
-        prompt_ids.push(IMAGE_START_ID);
-        prompt_ids.extend(std::iter::repeat_n(
-            IMAGE_TOKEN_ID,
-            prep.overview.llm_tokens(mode),
-        ));
-        prompt_ids.push(IMAGE_END_ID);
-        if !prep.slices.is_empty() && prep.slice_rows > 0 && prep.slice_cols > 0 {
-            for r in 0..prep.slice_rows {
-                if r > 0 {
-                    prompt_ids.push(NEWLINE_ID);
-                }
-                for c in 0..prep.slice_cols {
-                    let s = &prep.slices[r * prep.slice_cols + c];
-                    prompt_ids.push(SLICE_START_ID);
-                    prompt_ids.extend(std::iter::repeat_n(IMAGE_TOKEN_ID, s.llm_tokens(mode)));
-                    prompt_ids.push(SLICE_END_ID);
-                }
-            }
-        }
-        prompt_ids.push(NEWLINE_ID);
-        let suffix = format!("{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n");
-        prompt_ids.extend(self.encode_text(&suffix)?);
-
-        let target_sizes = prep.target_sizes();
-        let (pos3d, rope_delta) = compute_canvas_mrope(&prompt_ids, &target_sizes, mode);
+        let (prompt_ids, pos3d, rope_delta) = self.build_multimodal_prompt(&prep, prompt, mode)?;
         self.reset();
         self.rope_delta = rope_delta;
 
+        // Prefill the multimodal prompt with Canvas 3D M-RoPE positions and scattered image
+        // features.
         let t_prefill_start = Instant::now();
         let mut img_feat_cursor = 0_usize;
         let mut start = 0;
@@ -3443,66 +3262,6 @@ impl NanoEngine {
     }
 }
 
-// ============================================================================
-// Tokio Async Multi-Agent Engine Handle (`AsyncEngineHandle`)
-// ============================================================================
-
-/// Streaming event emitted per agent during `AsyncEngineHandle::run_agents_streaming`.
-pub enum AgentStreamEvent {
-    Header {
-        agent_idx: usize,
-        total_agents: usize,
-    },
-    Piece(String),
-    AgentDone {
-        device_name: String,
-        ane_enabled: bool,
-        report: Box<GenerationReport>,
-    },
-}
-
-enum AsyncEngineCommand {
-    ChatText {
-        prompt_text: String,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        piece_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-        reply: tokio::sync::oneshot::Sender<crate::Result<GenerationReport>>,
-    },
-    ChatIds {
-        prompt_ids: Vec<u32>,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        piece_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-        reply: tokio::sync::oneshot::Sender<crate::Result<GenerationReport>>,
-    },
-    Multimodal {
-        image_bytes: Vec<u8>,
-        prompt: String,
-        mode: DownsampleMode,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        piece_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-        reply: tokio::sync::oneshot::Sender<crate::Result<GenerationReport>>,
-    },
-    WarmPrefix {
-        prefix_text: String,
-        reply: tokio::sync::oneshot::Sender<crate::Result<usize>>,
-    },
-    Score {
-        prompt: ScorePrompt,
-        reply: tokio::sync::oneshot::Sender<crate::Result<ScoredPrompt>>,
-    },
-    Agents {
-        system_prompt: String,
-        agent_prompts: Vec<String>,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        event_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
-        reply: tokio::sync::oneshot::Sender<crate::Result<Vec<GenerationReport>>>,
-    },
-}
-
 /// A raw prompt to score: text the engine tokenizes, or token ids a client already produced.
 pub enum ScorePrompt {
     Text(String),
@@ -3518,346 +3277,6 @@ pub struct ScoredPrompt {
     pub top_pieces: Vec<String>,
 }
 
-/// Thread-safe `Clone + Send + Sync` Tokio async handle to a dedicated `NanoEngine` worker.
-///
-/// Runs a single-threaded Tokio runtime that awaits non-blocking GPU completions and shares `PrefixCache`.
-#[derive(Clone)]
-pub struct AsyncEngineHandle {
-    tx: tokio::sync::mpsc::UnboundedSender<AsyncEngineCommand>,
-    device_name: String,
-    ane_status: serde_json::Value,
-}
+mod async_handle;
 
-impl AsyncEngineHandle {
-    /// Open `NanoEngine` on a dedicated async worker thread and return a cloneable `AsyncEngineHandle`.
-    pub async fn open(model_path: &Path) -> crate::Result<Self> {
-        let path_buf = model_path.to_path_buf();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AsyncEngineCommand>();
-        let (init_tx, init_rx) =
-            tokio::sync::oneshot::channel::<crate::Result<(String, serde_json::Value)>>();
-        std::thread::Builder::new()
-            .name("nano-engine-tokio-worker".into())
-            .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        let _ = init_tx.send(Err(Error::Io(err)));
-                        return;
-                    }
-                };
-                let mut engine = match NanoEngine::open(&path_buf) {
-                    Ok(eng) => {
-                        let _ = init_tx.send(Ok((eng.device_name(), eng.ane_status())));
-                        eng
-                    }
-                    Err(err) => {
-                        let _ = init_tx.send(Err(err));
-                        return;
-                    }
-                };
-                rt.block_on(async move {
-                    while let Some(cmd) = rx.recv().await {
-                        match cmd {
-                            AsyncEngineCommand::ChatText {
-                                prompt_text,
-                                max_new_tokens,
-                                params,
-                                piece_tx,
-                                reply,
-                            } => {
-                                let res = match engine.encode_text(&prompt_text) {
-                                    Ok(ids) => {
-                                        engine
-                                            .generate_ids_streaming_async_stoppable(
-                                                &ids,
-                                                max_new_tokens,
-                                                params,
-                                                |piece| {
-                                                    if let Some(tx) = &piece_tx {
-                                                        let _ = tx.send(piece.to_owned());
-                                                    }
-                                                },
-                                                || piece_tx.as_ref().is_some_and(tokio::sync::mpsc::UnboundedSender::is_closed),
-                                            )
-                                            .await
-                                    }
-                                    Err(e) => Err(e),
-                                };
-                                let _ = reply.send(res);
-                            }
-                            AsyncEngineCommand::ChatIds {
-                                prompt_ids,
-                                max_new_tokens,
-                                params,
-                                piece_tx,
-                                reply,
-                            } => {
-                                let res = engine
-                                    .generate_ids_streaming_async_stoppable(
-                                        &prompt_ids,
-                                        max_new_tokens,
-                                        params,
-                                        |piece| {
-                                            if let Some(tx) = &piece_tx {
-                                                let _ = tx.send(piece.to_owned());
-                                            }
-                                        },
-                                        || piece_tx.as_ref().is_some_and(tokio::sync::mpsc::UnboundedSender::is_closed),
-                                    )
-                                    .await;
-                                let _ = reply.send(res);
-                            }
-                            AsyncEngineCommand::Multimodal {
-                                image_bytes,
-                                prompt,
-                                mode,
-                                max_new_tokens,
-                                params,
-                                piece_tx,
-                                reply,
-                            } => {
-                                let res = engine
-                                    .generate_multimodal_streaming_async_stoppable(
-                                        &image_bytes,
-                                        &prompt,
-                                        mode,
-                                        max_new_tokens,
-                                        params,
-                                        |piece| {
-                                            if let Some(tx) = &piece_tx {
-                                                let _ = tx.send(piece.to_owned());
-                                            }
-                                        },
-                                        || piece_tx.as_ref().is_some_and(tokio::sync::mpsc::UnboundedSender::is_closed),
-                                    )
-                                    .await;
-                                let _ = reply.send(res);
-                            }
-                            AsyncEngineCommand::WarmPrefix { prefix_text, reply } => {
-                                let _ = reply.send(engine.warm_prefix_cache(&prefix_text));
-                            }
-                            AsyncEngineCommand::Score { prompt, reply } => {
-                                let _ = reply.send(engine.score_prompt(prompt));
-                            }
-                            AsyncEngineCommand::Agents {
-                                system_prompt,
-                                agent_prompts,
-                                max_new_tokens,
-                                params,
-                                event_tx,
-                                reply,
-                            } => {
-                                let res = async {
-                                    if agent_prompts.len() > 1 {
-                                        let shared_prefix = format!(
-                                            "<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n"
-                                        );
-                                        let _ = engine.warm_prefix_cache(&shared_prefix);
-                                    }
-                                    let total_agents = agent_prompts.len();
-                                    let dev_name = engine.device_name();
-                                    let ane_enabled =
-                                        engine.ane_status()["enabled"].as_bool().unwrap_or(false);
-                                    let mut reports = Vec::with_capacity(total_agents);
-                                    for (agent_idx, agent_prompt) in
-                                        agent_prompts.iter().enumerate()
-                                    {
-                                        if let Some(tx) = &event_tx {
-                                            let _ = tx.send(AgentStreamEvent::Header {
-                                                agent_idx,
-                                                total_agents,
-                                            });
-                                        }
-                                        let formatted = NanoEngine::format_chat_prompt_with_system(
-                                            &system_prompt,
-                                            agent_prompt,
-                                        );
-                                        let ids = engine.encode_text(&formatted)?;
-                                        let rep = engine
-                                            .generate_ids_streaming_async(
-                                                &ids,
-                                                max_new_tokens,
-                                                params.clone(),
-                                                |piece| {
-                                                    if let Some(tx) = &event_tx {
-                                                        let _ = tx.send(AgentStreamEvent::Piece(
-                                                            piece.to_owned(),
-                                                        ));
-                                                    }
-                                                },
-                                            )
-                                            .await?;
-                                        if let Some(tx) = &event_tx {
-                                            let _ = tx.send(AgentStreamEvent::AgentDone {
-                                                device_name: dev_name.clone(),
-                                                ane_enabled,
-                                                report: Box::new(rep.clone()),
-                                            });
-                                        }
-                                        reports.push(rep);
-                                    }
-                                    Ok(reports)
-                                }
-                                .await;
-                                let _ = reply.send(res);
-                            }
-                        }
-                    }
-                });
-            })
-            .map_err(Error::Io)?;
-        let (device_name, ane_status) = init_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("worker init dropped".into()))??;
-        Ok(Self {
-            tx,
-            device_name,
-            ane_status,
-        })
-    }
-
-    #[must_use]
-    pub fn device_name(&self) -> &str {
-        &self.device_name
-    }
-
-    #[must_use]
-    pub const fn ane_status(&self) -> &serde_json::Value {
-        &self.ane_status
-    }
-
-    #[must_use]
-    pub fn ane_enabled(&self) -> bool {
-        self.ane_status["enabled"].as_bool().unwrap_or(false)
-    }
-
-    /// Asynchronously pre-prefill and pin `prefix_text` in the shared GPU `PrefixCache`.
-    pub async fn warm_prefix_cache(&self, prefix_text: String) -> crate::Result<usize> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(AsyncEngineCommand::WarmPrefix {
-                prefix_text,
-                reply: reply_tx,
-            })
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle worker closed".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle reply dropped".into()))?
-    }
-
-    /// Asynchronously teacher-force `prompt` (see `NanoEngine::score_tokens`).
-    pub async fn score_prompt(&self, prompt: ScorePrompt) -> crate::Result<ScoredPrompt> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(AsyncEngineCommand::Score {
-                prompt,
-                reply: reply_tx,
-            })
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle worker closed".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle reply dropped".into()))?
-    }
-
-    /// Asynchronously encode and generate a completion from `prompt_text`, streaming pieces to `piece_tx` if provided.
-    pub async fn generate_text(
-        &self,
-        prompt_text: String,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        piece_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    ) -> crate::Result<GenerationReport> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(AsyncEngineCommand::ChatText {
-                prompt_text,
-                max_new_tokens,
-                params,
-                piece_tx,
-                reply: reply_tx,
-            })
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle worker closed".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle reply dropped".into()))?
-    }
-
-    /// Asynchronously generate a completion from `prompt_ids`, streaming pieces to `piece_tx` if provided.
-    pub async fn generate_ids(
-        &self,
-        prompt_ids: Vec<u32>,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        piece_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    ) -> crate::Result<GenerationReport> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(AsyncEngineCommand::ChatIds {
-                prompt_ids,
-                max_new_tokens,
-                params,
-                piece_tx,
-                reply: reply_tx,
-            })
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle worker closed".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle reply dropped".into()))?
-    }
-
-    /// Asynchronously generate a multimodal completion from `image_bytes` + `prompt`.
-    pub async fn generate_multimodal(
-        &self,
-        image_bytes: Vec<u8>,
-        prompt: String,
-        mode: DownsampleMode,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        piece_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    ) -> crate::Result<GenerationReport> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(AsyncEngineCommand::Multimodal {
-                image_bytes,
-                prompt,
-                mode,
-                max_new_tokens,
-                params,
-                piece_tx,
-                reply: reply_tx,
-            })
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle worker closed".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle reply dropped".into()))?
-    }
-
-    /// Asynchronously execute a batch of collaborating agents sharing `system_prompt` and `PrefixCache`.
-    pub async fn run_agents(
-        &self,
-        system_prompt: String,
-        agent_prompts: Vec<String>,
-        max_new_tokens: usize,
-        params: SamplingParams,
-        event_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentStreamEvent>>,
-    ) -> crate::Result<Vec<GenerationReport>> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(AsyncEngineCommand::Agents {
-                system_prompt,
-                agent_prompts,
-                max_new_tokens,
-                params,
-                event_tx,
-                reply: reply_tx,
-            })
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle worker closed".into()))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InvalidArgument("AsyncEngineHandle reply dropped".into()))?
-    }
-}
-
+pub use async_handle::{AgentStreamEvent, AsyncEngineHandle};

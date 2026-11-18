@@ -20,8 +20,8 @@ use nano_metal::context::MetalContext;
 use nano_metal::projection::AnyMatrix;
 use nano_metal::shaders::ShaderLibrary;
 
-use crate::artifact::MappedArtifact;
-use crate::model::{FFN, WIDTH};
+use crate::artifact::{MappedArtifact, MatrixHandle};
+use crate::model::{FFN, LAYERS, WIDTH};
 
 pub const ANE_FUNCTION_ROWS: [u32; 2] = [256, 512];
 /// Narrowest prefill chunk the ANE takes; narrower chunks stay on the GPU.
@@ -218,6 +218,9 @@ pub struct AneFfnOffload {
     pub status: MetalBuffer,
     /// Per-layer FFN time `(gpu, ane)` in ms measured when the offload was enabled.
     pub layer_ms: (f64, f64),
+    /// `gate/up/down` handles resolved once per layer, so `stage_layer` does no tensor-name
+    /// lookups on the prefill path. `None` for a layer that is not three `INT4_G64` matrices.
+    ffn_handles: Vec<Option<(MatrixHandle, MatrixHandle, MatrixHandle)>>,
 }
 
 impl AneFfnOffload {
@@ -264,7 +267,37 @@ impl AneFfnOffload {
             bindings,
             status,
             layer_ms: (0.0, 0.0),
+            ffn_handles: Vec::new(),
         })
+    }
+
+    /// Resolve every language layer's `gate_proj`/`up_proj`/`down_proj` handles once, so later
+    /// `stage_layer` calls do no tensor-name lookups. `Ok(false)` when some layer is not three
+    /// `INT4_G64` matrices.
+    pub fn resolve_ffn_handles(&mut self, artifact: &MappedArtifact) -> crate::Result<bool> {
+        self.ffn_handles = (0..LAYERS)
+            .map(|layer| {
+                let m = |name: &str| {
+                    let prefix = format!("model.language_model.layers.{layer}.mlp");
+                    artifact.matrix(&format!("{prefix}.{name}"))
+                };
+                let (AnyMatrix::Int4(_), false) = m("gate_proj.weight")? else {
+                    return Ok(None);
+                };
+                let (AnyMatrix::Int4(_), false) = m("up_proj.weight")? else {
+                    return Ok(None);
+                };
+                let (AnyMatrix::Int4(_), false) = m("down_proj.weight")? else {
+                    return Ok(None);
+                };
+                let h = |name: &str| {
+                    artifact
+                        .matrix_handle(&format!("model.language_model.layers.{layer}.mlp.{name}"))
+                };
+                Ok(Some((h("gate_proj.weight")?, h("up_proj.weight")?, h("down_proj.weight")?)))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(self.ffn_handles.iter().all(Option::is_some))
     }
 
     /// Stage `layer`'s `gate_proj`, `up_proj`, and `down_proj` into weight set `set_idx`.
@@ -275,17 +308,16 @@ impl AneFfnOffload {
         layer: usize,
         set_idx: usize,
     ) -> crate::Result<bool> {
-        let prefix = format!("model.language_model.layers.{layer}.mlp");
-        let (AnyMatrix::Int4(gate), false) = artifact.matrix(&format!("{prefix}.gate_proj.weight"))?
-        else {
+        let Some((gate_h, up_h, down_h)) = self.ffn_handles.get(layer).copied().flatten() else {
             return Ok(false);
         };
-        let (AnyMatrix::Int4(up), false) = artifact.matrix(&format!("{prefix}.up_proj.weight"))?
-        else {
+        let (AnyMatrix::Int4(gate), false) = artifact.matrix_at(gate_h) else {
             return Ok(false);
         };
-        let (AnyMatrix::Int4(down), false) = artifact.matrix(&format!("{prefix}.down_proj.weight"))?
-        else {
+        let (AnyMatrix::Int4(up), false) = artifact.matrix_at(up_h) else {
+            return Ok(false);
+        };
+        let (AnyMatrix::Int4(down), false) = artifact.matrix_at(down_h) else {
             return Ok(false);
         };
         let set = &self.sets[set_idx];
