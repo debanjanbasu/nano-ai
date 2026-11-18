@@ -911,7 +911,10 @@ fn build_chat_completion_json(
             "decode_tok_per_s": rep.decode_tok_per_s,
             "cached_prefix_tokens": rep.cached_prefix_tokens,
             "accepted_tokens": rep.accepted_tokens,
-            "drafted_tokens": rep.drafted_tokens
+            "drafted_tokens": rep.drafted_tokens,
+            "decode_encode_ms": rep.decode_encode_ms,
+            "decode_cpu_ms": rep.decode_cpu_ms,
+            "decode_dispatches": rep.decode_dispatches
         }
     })
 }

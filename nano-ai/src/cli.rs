@@ -391,7 +391,7 @@ fn render_telemetry_footer(
     if !err_term.is_term() {
         let footer_style = Style::new().dim().for_stderr();
         let footer = format!(
-            "[{} | ANE: {} | cache: {}/{} | prefill: {:.1} tok/s ({:.1} ms) | decode: {:.1} tok/s ({:.1} ms) | spec accepted: {}/{}]",
+            "[{} | ANE: {} | cache: {}/{} | prefill: {:.1} tok/s ({:.1} ms) | decode: {:.1} tok/s ({:.1} ms) | encode: {:.1} ms | spec accepted: {}/{}]",
             device_name,
             ane_enabled,
             report.cached_prefix_tokens,
@@ -400,6 +400,7 @@ fn render_telemetry_footer(
             report.prefill_ms,
             report.decode_tok_per_s,
             report.decode_ms,
+            report.decode_encode_ms,
             report.accepted_tokens,
             report.drafted_tokens
         );
@@ -443,6 +444,10 @@ fn render_telemetry_footer(
         "DSpark {}/{} ({pct:.0}%)",
         report.accepted_tokens, report.drafted_tokens
     ));
+    let encode_seg = Style::new().dim().for_stderr().apply_to(format!(
+        "CPU encode {:.1} ms",
+        report.decode_encode_ms
+    ));
 
     if report.cached_prefix_tokens > 0 {
         let cache_seg = Style::new().cyan().bold().for_stderr().apply_to(format!(
@@ -450,11 +455,11 @@ fn render_telemetry_footer(
             report.cached_prefix_tokens, report.prompt_tokens
         ));
         eprintln!(
-            "\n{chip_badge} {sep} {ane_badge} {sep} {cache_seg} {sep} {prefill_seg} {sep} {decode_seg} {sep} {spec_seg}"
+            "\n{chip_badge} {sep} {ane_badge} {sep} {cache_seg} {sep} {prefill_seg} {sep} {decode_seg} {sep} {spec_seg} {sep} {encode_seg}"
         );
     } else {
         eprintln!(
-            "\n{chip_badge} {sep} {ane_badge} {sep} {prefill_seg} {sep} {decode_seg} {sep} {spec_seg}"
+            "\n{chip_badge} {sep} {ane_badge} {sep} {prefill_seg} {sep} {decode_seg} {sep} {spec_seg} {sep} {encode_seg}"
         );
     }
 }

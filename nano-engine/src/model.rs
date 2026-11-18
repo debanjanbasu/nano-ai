@@ -125,6 +125,15 @@ pub struct GenerationReport {
     pub drafted_tokens: usize,
     pub accepted_tokens: usize,
     pub ngram_accepted_tokens: usize,
+    /// CPU time spent encoding command batches during decode (excludes GPU waits) — the gap
+    /// between this and `decode_ms` is the GPU-bound share, and this itself is the encode-side
+    /// headroom (dispatch count, CPU-side penalty/n-gram work).
+    pub decode_encode_ms: f64,
+    /// CPU time in the CPU-only per-round work: DRY penalty build, n-gram lookup, recent-token
+    /// bookkeeping. Included in `decode_encode_ms`.
+    pub decode_cpu_ms: f64,
+    /// GPU dispatches encoded during decode — the launch-overhead surface.
+    pub decode_dispatches: u64,
 }
 
 /// Next-token statistics at one position of a teacher-forced prompt (`NanoEngine::score_tokens`).
@@ -373,6 +382,12 @@ pub struct NanoEngine {
     prefix_cache_enabled: bool,
     /// Checkpoints persisted next to the model; `None` when that directory is not writable.
     disk_cache: Option<DiskCache>,
+    /// Per-generation instrumentation: CPU ms spent in `encode_forward_step` and the dispatches
+    /// encoded, reset at decode start and drained into `GenerationReport`.
+    last_encode_ms: f64,
+    last_dispatches: u64,
+    /// CPU-only per-round work (n-gram lookup), part of the encode-side share.
+    last_cpu_ms: f64,
 }
 
 impl NanoEngine {
@@ -561,6 +576,9 @@ impl NanoEngine {
             cache_tick: 0,
             prefix_cache_enabled: true,
             disk_cache,
+            last_encode_ms: 0.0,
+            last_dispatches: 0,
+            last_cpu_ms: 0.0,
         })
     }
 
@@ -1492,6 +1510,7 @@ impl NanoEngine {
         sample_top_k: usize,
     ) -> crate::Result<()> {
         let (fut, ane_offload) = {
+            let t = Instant::now();
             let (batch, ane_offload) = self.encode_forward_step(
                 None,
                 token_ids,
@@ -1502,6 +1521,8 @@ impl NanoEngine {
                 sample_top_k,
                 !speculative_verify,
             )?;
+            self.last_encode_ms = t.elapsed().as_secs_f64().mul_add(1e3, self.last_encode_ms);
+            self.last_dispatches += u64::from(batch.dispatch_count());
             (batch.commit_and_await(), ane_offload)
         };
         fut.await?;
@@ -2243,6 +2264,7 @@ impl NanoEngine {
         ngrams: bool,
         min_pos: usize,
     ) {
+        let t_cpu = Instant::now();
         self.dry_scratch.clear();
         if (self.rep_penalty - 1.0).abs() > 1e-4 {
             self.dry_scratch.extend_from_slice(&self.recent_token_counts);
@@ -2296,6 +2318,7 @@ impl NanoEngine {
                 }
             }
         }
+        self.last_cpu_ms = t_cpu.elapsed().as_secs_f64().mul_add(1e3, self.last_cpu_ms);
     }
     #[cfg(test)]
     #[must_use]
@@ -2640,10 +2663,16 @@ impl NanoEngine {
                 drafted_tokens: 0,
                 accepted_tokens: 0,
                 ngram_accepted_tokens: 0,
+                decode_encode_ms: 0.0,
+                decode_cpu_ms: 0.0,
+                decode_dispatches: 0,
             });
         }
 
         let t_decode_start = Instant::now();
+        self.last_encode_ms = 0.0;
+        self.last_dispatches = 0;
+        self.last_cpu_ms = 0.0;
         let mut speculative_rounds = 0_usize;
         let mut drafted_tokens = 0_usize;
         let mut accepted_tokens = 0_usize;
@@ -2702,7 +2731,9 @@ impl NanoEngine {
                 pre_verified = verified;
                 d_toks
             } else if remaining > 1 && sampler.is_greedy() {
+                let t_cpu = Instant::now();
                 let ng = lookup_ngram_draft_adaptive(&history, closed_thinking, remaining.min(7));
+                self.last_cpu_ms = t_cpu.elapsed().as_secs_f64().mul_add(1e3, self.last_cpu_ms);
                 if !ng.is_empty() {
                     used_ngram = true;
                     ng
@@ -2736,16 +2767,22 @@ impl NanoEngine {
                             if let Some(drafter) = &self.drafter {
                                 self.encode_embed_gather(&mut batch, drafter.draft_tokens(), rows);
                             }
-                            let (verify_batch, _) = self.encode_forward_step(
-                                Some(batch),
-                                None,
-                                rows,
-                                Rope::Text(self.rope_delta),
-                                true,
-                                rows,
-                                sampler.active_top_k(),
-                                false,
-                            )?;
+                            let (verify_batch, _) = {
+                                let t = Instant::now();
+                                let r = self.encode_forward_step(
+                                    Some(batch),
+                                    None,
+                                    rows,
+                                    Rope::Text(self.rope_delta),
+                                    true,
+                                    rows,
+                                    sampler.active_top_k(),
+                                    false,
+                                )?;
+                                self.last_encode_ms = t.elapsed().as_secs_f64().mul_add(1e3, self.last_encode_ms);
+                                self.last_dispatches += u64::from(r.0.dispatch_count());
+                                r
+                            };
                             (blk_len, verify_batch.commit_and_await())
                         };
                         fut.await?;
@@ -3009,16 +3046,22 @@ impl NanoEngine {
                                 verify_block.extend_from_slice(&ng_cpu);
                                 self.encode_embed_tokens(&mut batch, &verify_block);
                             }
-                            let (verify_batch, _) = self.encode_forward_step(
-                                Some(batch),
-                                None,
-                                rows,
-                                Rope::Text(self.rope_delta),
-                                true,
-                                rows,
-                                sampler.active_top_k(),
-                                false,
-                            )?;
+                            let (verify_batch, _) = {
+                                let t = Instant::now();
+                                let r = self.encode_forward_step(
+                                    Some(batch),
+                                    None,
+                                    rows,
+                                    Rope::Text(self.rope_delta),
+                                    true,
+                                    rows,
+                                    sampler.active_top_k(),
+                                    false,
+                                )?;
+                                self.last_encode_ms = t.elapsed().as_secs_f64().mul_add(1e3, self.last_encode_ms);
+                                self.last_dispatches += u64::from(r.0.dispatch_count());
+                                r
+                            };
                             fused = true;
                             Some(verify_batch.commit_and_await())
                         } else {
@@ -3131,6 +3174,9 @@ impl NanoEngine {
             drafted_tokens,
             accepted_tokens,
             ngram_accepted_tokens,
+            decode_encode_ms: self.last_encode_ms + self.last_cpu_ms,
+            decode_cpu_ms: self.last_cpu_ms,
+            decode_dispatches: self.last_dispatches,
         })
     }
 
