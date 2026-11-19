@@ -60,7 +60,7 @@ struct ContentView: View {
             Button(running ? "Running…" : "Run") {
                 running = true
                 Task {
-                    output = await runEngine(prompt: prompt, image: nil, maxTokens: 512)
+                    output = await runEngine(prompt: prompt, image: nil, maxTokens: 0)
                     running = false
                 }
             }
@@ -93,7 +93,7 @@ struct ContentView: View {
             let report = await runEngine(
                 prompt: text,
                 image: value("--image"),
-                maxTokens: value("--max-tokens").flatMap(UInt32.init) ?? 512
+                maxTokens: value("--max-tokens").flatMap(UInt32.init) ?? 0
             )
             print(report)
             fflush(stdout)

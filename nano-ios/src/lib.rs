@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::Instant;
 
-use nano_engine::model::NanoEngine;
+use nano_engine::model::{MAX_CONTEXT_TOKENS, NanoEngine};
 use nano_engine::sampler::SamplingParams;
 use nano_engine::vision::DownsampleMode;
 use nano_metal::memory::{budget, usage};
@@ -130,7 +130,8 @@ fn run(
 /// Run one prompt and return its JSON report, to release with `nano_ai_free`.
 ///
 /// The model is the one in `model_dir`; `image_path` (relative to `model_dir`, may be null) adds an
-/// image; at most `max_tokens` tokens are generated. Failures come back as `{"error": …}`.
+/// image; at most `max_tokens` tokens are generated, with `0` using the full context window
+/// (`nano_engine::model::MAX_CONTEXT_TOKENS`). Failures come back as `{"error": …}`.
 ///
 /// # Safety
 ///
@@ -153,7 +154,17 @@ pub unsafe extern "C" fn nano_ai_run(
         )
     };
     let json = on_engine_thread(move |slot| {
-        run(slot, &dir, &prompt, image.as_deref(), max_tokens as usize)
+        run(
+            slot,
+            &dir,
+            &prompt,
+            image.as_deref(),
+            if max_tokens == 0 {
+                MAX_CONTEXT_TOKENS
+            } else {
+                max_tokens as usize
+            },
+        )
             .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string(), "memory": memory() }))
     })
     .unwrap_or_else(|| serde_json::json!({ "error": "engine thread stopped" }));

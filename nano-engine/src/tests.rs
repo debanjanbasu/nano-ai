@@ -1021,3 +1021,34 @@ fn mpp_int4_gemms_match_wide_kernels() {
         }
     }
 }
+
+/// One-time prefill-width calibration at open must leave the engine in its just-constructed
+/// state: the timed synthetic prefill passes wrote KV rows and GDN state, and `reset()` has to
+/// unwind all of it before the first real prompt.
+#[test]
+fn prefill_rows_calibration_keeps_state_clean() {
+    if MetalContext::new().is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("nano_ai_prefill_calib_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let model_path = dir.join("prefill_calib.bin");
+    write_synthetic_lm_artifact(&model_path, true).unwrap();
+    let mut engine = NanoEngine::open(&model_path).unwrap();
+
+    let (position, rope_delta, active_tokens, checkpoints, prefill_rows) =
+        engine.calibration_test_state();
+    assert_eq!(position, 0, "calibration must not advance the position");
+    assert_eq!(active_tokens, 0, "calibration must not leave resident tokens");
+    assert_eq!(checkpoints, 0, "calibration must not create prefix checkpoints");
+    assert_eq!(rope_delta, 0, "calibration must not set a rope delta");
+    assert!(
+        [128, 256, 512].contains(&prefill_rows),
+        "calibrated prefill_rows {prefill_rows} is not one of 128/256/512"
+    );
+    // The engine must still work end to end after calibration rewrote the profile.
+    let report = engine
+        .generate_ids(&[10, 20, 30, 40, 50], 2, SamplingParams::default())
+        .unwrap();
+    assert_eq!(report.generated_tokens, 2);
+}

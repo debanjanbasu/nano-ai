@@ -156,6 +156,20 @@ pub struct MemoryProfile {
     pub prefill_rows: usize,
     /// Full-attention KV precision: 8 bits when a full-window cache fits, else 4.
     pub kv_bits: u8,
+    /// Context length at or below which the engine runs the full-attention KV cache in Q8;
+    /// above it the engine switches to Q4 (`apply_kv_format_for_position` in `NanoEngine`).
+    ///
+    /// Decode is KV-bandwidth-bound, so Q4 halves KV reads for long contexts; Q8 stays fastest
+    /// for short ones. This is the largest power-of-two capacity (starting at 1,024, doubling)
+    /// whose Q8 peak — `peak(12 * KvFormat::Q8.token_bytes(), cap)` — stays within half the
+    /// budget, capped at `MAX_CONTEXT_TOKENS`. It leaves the device-level `kv_bits` default
+    /// untouched: that one sizes memory, this one only gates the generation-time switch.
+    ///
+    /// Per-budget thresholds: on an 8 GiB Mac the Q8 peak at the full 262,144-token window
+    /// already fits within half the budget, so the threshold lands at 262,144 and the switch
+    /// effectively never fires; on a 2 GiB phone it lands around 16,384-32,768, so long
+    /// generations there run in Q4.
+    pub kv_q8_max_tokens: usize,
     /// Prefix-cache checkpoints kept (~10.4 MiB of recurrent state each, plus their KV).
     pub prefix_checkpoints: usize,
     /// Byte budget of the on-disk prompt cache (`prompt_cache`), least recently used files evicted first.
@@ -177,6 +191,16 @@ impl MemoryProfile {
             budget_bytes,
             prefill_rows: if roomy { 512 } else { 128 },
             kv_bits: if lm_q8 <= budget_bytes / 2 { 8 } else { 4 },
+            kv_q8_max_tokens: {
+                let mut threshold = 1024usize;
+                while threshold * 2 <= MAX_CONTEXT_TOKENS
+                    && peak(12 * KvFormat::Q8.token_bytes(), threshold * 2)
+                        <= budget_bytes / 2
+                {
+                    threshold *= 2;
+                }
+                threshold
+            },
             prefix_checkpoints: if roomy { 12 } else { 2 },
             prompt_cache_bytes: if roomy { 4 << 30 } else { 512 << 20 },
             keep_vision: roomy,
@@ -516,7 +540,7 @@ impl NanoEngine {
                 DiskCache::open(&dir.join(".prompt-cache"), key, kv_format, profile.prompt_cache_bytes)
             });
         let ane = AneState::start();
-        Ok(Self {
+        let mut engine = Self {
             shaders,
             proj,
             ops,
@@ -579,7 +603,11 @@ impl NanoEngine {
             last_encode_ms: 0.0,
             last_dispatches: 0,
             last_cpu_ms: 0.0,
-        })
+        };
+        // One-time device calibration, after every buffer exists and before the first real
+        // prompt: the tuned width is already in place when the user's first prefill runs.
+        engine.calibrate_prefill_rows();
+        Ok(engine)
     }
 
 
@@ -1187,6 +1215,94 @@ impl NanoEngine {
         Ok(Ok(Box::new(offload)))
     }
 
+    /// Pick the GPU prefill chunk width by measuring per-token prefill throughput on the actual
+    /// device, keeping the fastest of 128 / 256 / 512 rows. Runs once from `open_with_profile`,
+    /// after every buffer exists and before the first real prompt. Modeled on `check_ane`:
+    /// per candidate, 2 warmup passes warm pipelines and 3 timed passes are kept at their best,
+    /// then the times are divided by the chunk width so narrow-but-cheap chunks compete fairly
+    /// with wide ones.
+    ///
+    /// Skipped when `profile.prefill_rows` is already the 128-row floor (phones without an ANE)
+    /// and never touches `self.ane`: the ANE decision is independent and the ANE programs only
+    /// accept 256/512 rows anyway, so this calibrates the GPU fallback path exclusively by
+    /// encoding each pass with `allow_ane = false`.
+    ///
+    /// Cost: 3 candidates x 5 passes x 512 rows = 7.5K tokens of prefill, about 2-4 ms on
+    /// M-class hardware — an acceptable one-time toll at open.
+    fn calibrate_prefill_rows(&mut self) {
+        const CANDIDATES: [usize; 3] = [128, 256, 512];
+        if self.profile.prefill_rows <= CANDIDATES[0] {
+            return;
+        }
+        let mut best_rows = self.profile.prefill_rows;
+        let mut best_per_token = f64::INFINITY;
+        let mut failed = false;
+        for &rows in &CANDIDATES {
+            if rows > self.profile.prefill_rows {
+                continue;
+            }
+            let chunk_ids = vec![100_u32; rows]; // Any id < VOCAB works; contents don't matter.
+            let mut per_token = f64::INFINITY;
+            for pass in 0..2 + 3 {
+                // Each pass starts from position 0 so the timed steps never grow the KV
+                // buffers past the initial 1,024-row capacity (a 7,680-row calibration would
+                // otherwise leave an ~8x oversize cache allocated at open).
+                self.reset();
+                let start = Instant::now();
+                let result = self.encode_forward_step(
+                    None,
+                    Some(&chunk_ids),
+                    rows,
+                    Rope::Text(0),
+                    false,
+                    0,
+                    0,
+                    false,
+                );
+                match result {
+                    // `encode_forward_step` never returns an offload when ANE encoding is refused.
+                    Ok((batch, _ane_offload)) => {
+                        failed |= batch.commit_and_wait().is_err();
+                    }
+                    Err(_) => failed = true,
+                }
+                if failed {
+                    break;
+                }
+                if pass >= 2 {
+                    per_token = per_token.min(start.elapsed().as_secs_f64() / rows as f64);
+                }
+            }
+            if failed {
+                break;
+            }
+            if per_token < best_per_token {
+                best_per_token = per_token;
+                best_rows = rows;
+            }
+        }
+        if failed {
+            return; // Keep the current profile value on any error.
+        }
+        self.profile.prefill_rows = best_rows;
+        // Leave no side effects: the timed steps wrote KV rows and GDN state for a synthetic
+        // prompt, so unwind to the just-opened state.
+        self.reset();
+    }
+
+    /// Introspection for tests: `(position, rope_delta, resident tokens, prefix checkpoints,
+    /// prefill_rows)` after open, so the calibration test can assert the state is clean.
+    #[cfg(test)]
+    pub(crate) const fn calibration_test_state(&self) -> (usize, i32, usize, usize, usize) {
+        (
+            self.position,
+            self.rope_delta,
+            self.active_tokens.len(),
+            self.prefix_cache.len(),
+            self.profile.prefill_rows,
+        )
+    }
+
     /// Format a single-turn user prompt using MiniCPM-V 4.7's chat template (thinking always enabled).
     #[must_use]
     pub fn format_chat_prompt(prompt: &str) -> String {
@@ -1415,6 +1531,7 @@ impl NanoEngine {
 
     /// Forward `tokens` rows (`hidden` already populated with input embeddings) through all 24 layers.
     fn ensure_kv_capacity(&mut self, needed: usize) -> crate::Result<()> {
+        self.apply_kv_format_for_position(needed);
         if needed <= self.kv_capacity {
             return Ok(());
         }
@@ -1461,6 +1578,35 @@ impl NanoEngine {
         self.attention_caches = new_caches;
         self.kv_capacity = new_cap;
         Ok(())
+    }
+
+    /// Switch the KV cache to Q4 once the context grows past `profile.kv_q8_max_tokens`.
+    ///
+    /// Decode is KV-bandwidth-bound, so past the threshold the halved Q4 reads win even though
+    /// Q8 is faster per step at short contexts. The switch only fires downward (Q8 → Q4) and
+    /// never back within a generation, so it cannot thrash. `set_kv_format` clears prefix
+    /// checkpoints and resets, which is acceptable here because this hook only runs when the
+    /// cache must grow anyway — except at position 0, where there is nothing to reset and the
+    /// reset must not run, so the raw format swap in `set_kv_format` is inlined without it.
+    fn apply_kv_format_for_position(&mut self, needed: usize) {
+        if needed <= self.profile.kv_q8_max_tokens || self.kv_format != KvFormat::Q8 {
+            return;
+        }
+        if self.position > 0 {
+            // `set_kv_format` clears prefix checkpoints and resets, which is fine here: the
+            // cache must grow anyway, so a rebuild was coming.
+            self.set_kv_format(KvFormat::Q4);
+        } else {
+            // At position 0 nothing needs preserving beyond the format itself: swap the
+            // format and reopen the disk cache without `reset()`, so a just-loaded prefix
+            // state survives.
+            if let Some(disk) = self.disk_cache.take() {
+                self.disk_cache = disk.reopen(KvFormat::Q4);
+            }
+            self.kv_format = KvFormat::Q4;
+            self.prefix_cache.clear();
+            self.reallocate_kv_buffers();
+        }
     }
 
     /// When `speculative_verify` is true, recurrent layers write to `rollback_state`/`rollback_history`
@@ -2741,7 +2887,14 @@ impl NanoEngine {
                     let emb = self.artifact.matrix_at(self.embed);
                     let lm_head = self.artifact.matrix_at(self.lm_head);
                     let fwd_len = self.drafter.as_ref().map_or(4, |d| d.recommended_forward_len(remaining.min(7)));
-                    let fuse_initial = (closed_thinking || !rpdi_saturated) && sampler.is_greedy();
+                    // Fusion now fires for reasoning-open rounds too: the drafter's
+                    // markov-walk kernel already applies rep penalty + recent token
+                    // counts, and the verify side rides on the row-0 DRY built from
+                    // `[anchor]` (dry_scratch_has_loop / RPDI loop-breaker still fire
+                    // there), so per-row DRY + think-end boost is only needed in the
+                    // unfused fallback once RPDI saturates. This halves GPU waits per
+                    // thinking round (draft wait + verify wait -> one fused wait).
+                    let fuse_initial = !rpdi_saturated && sampler.is_greedy();
                     if fuse_initial {
                         let (blk_len, fut) = {
                             let mut batch = CommandBatch::new_concurrent(&self.ctx)?;
@@ -2964,9 +3117,12 @@ impl NanoEngine {
                     } else {
                         Vec::new()
                     };
-                    // With reasoning closed, the verify penalties do not depend on the drafts, so
-                    // the next round's verify rides in this batch: one commit and one wait per round.
-                    let fuse_verify = (closed_thinking || !rpdi_saturated) && sampler.is_greedy();
+                    // Invariant: fusion fires unless RPDI is saturated or sampling is
+                    // non-greedy, including when reasoning is open — the fused batch
+                    // verifies with the row-0 DRY built from `[next_anchor]` and the
+                    // drafter's own kernel-side rep penalty; per-row DRY and the
+                    // think-end boost apply only in unfused (rpdi_saturated) rounds.
+                    let fuse_verify = !rpdi_saturated && sampler.is_greedy();
                     let mut fused = false;
                     let fut_opt = {
                         let mut batch = CommandBatch::new_concurrent(&self.ctx)?;
