@@ -109,6 +109,45 @@ pub fn schedule_verification_length_with_rate(
     (best_l, best_expected)
 }
 
+/// Detect a degenerate cycle at the end of `history`: the shortest period `p` (1..=64) whose
+/// suffix repeats `MIN_CYCLES` or more times back-to-back. Returns `(p, cycles)` — the loop
+/// continuation is `history[history.len() - p]` — or `None` when the tail is not cycling.
+/// Deliberately restricted to the last 512 tokens and short periods: legitimate structured
+/// output (JSON keys, code syntax) repeats with long periods or few cycles; only verbatim
+/// lock-in repeats a short unit many times in a row (arXiv 2610.24715: all surviving llama.cpp
+/// loops had period g <= 7).
+#[must_use]
+pub(crate) fn detect_degenerate_cycle(history: &[u32]) -> Option<(usize, usize)> {
+    const MIN_CYCLES: usize = 8;
+    let n = history.len();
+    if n < MIN_CYCLES {
+        return None;
+    }
+    let window_start = n.saturating_sub(512);
+    for p in 1..=64usize {
+        if n < p * MIN_CYCLES {
+            break;
+        }
+        // Count how many consecutive p-blocks ending at the tail match the last block.
+        let last = &history[n - p..];
+        let mut cycles = 1_usize;
+        let mut end = n - p;
+        while end >= window_start + p {
+            if &history[end - p..end] != last {
+                break;
+            }
+            cycles += 1;
+            end -= p;
+        }
+        if cycles >= MIN_CYCLES {
+            // The shortest qualifying period is returned; its multiples repeat the same
+            // continuation, so one penalty entry covers them.
+            return Some((p, cycles));
+        }
+    }
+    None
+}
+
 /// Prompt-Lookup (N-gram suffix) zero-cost drafter.
 ///
 /// Scans prompt and generated token history for the longest suffix match (≥ `min_match` tokens)
@@ -147,6 +186,12 @@ pub fn lookup_ngram_draft_adaptive(
     max_draft: usize,
 ) -> Vec<u32> {
     if max_draft == 0 {
+        return Vec::new();
+    }
+    // A degenerate cycle at the tail means the best suffix match IS the loop: drafting its
+    // continuation would feed the lock-in the cycle penalty is trying to break (arXiv
+    // 2610.24715). Return nothing and let the penalty push the model out of the rut.
+    if detect_degenerate_cycle(history).is_some() {
         return Vec::new();
     }
     let ng6 = lookup_ngram_draft(history, 6, max_draft);

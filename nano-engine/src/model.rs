@@ -32,7 +32,8 @@ use crate::ane_ffn::{
     relative_difference,
 };
 use crate::dspark::{
-    DSPARK_KV_RING, DSPARK_KV_TOKEN_BYTES, DSPARK_TAPS, DsparkDrafter, lookup_ngram_draft_adaptive,
+    detect_degenerate_cycle, DSPARK_KV_RING, DSPARK_KV_TOKEN_BYTES, DSPARK_TAPS, DsparkDrafter,
+    lookup_ngram_draft_adaptive,
 };
 use crate::prompt_cache::DiskCache;
 use crate::quant::deterministic_signs;
@@ -2423,7 +2424,28 @@ impl NanoEngine {
         }
         let hist_len = history.len();
         let search_start = hist_len.saturating_sub(512).max(min_pos);
-        if !ngrams || hist_len < search_start + 4 {
+        if !ngrams {
+            // Answers, code and tool calls never get DRY (identifiers must copy verbatim), but a
+            // degenerate verbatim cycle is not legitimate repetition: penalize the token that
+            // would extend the loop, growing with how many times it has already repeated. The
+            // cycle is already established in `history`, so the detection runs once and the
+            // penalty applies to every verify row (each row's context ends inside the same loop).
+            if let Some((period, cycles)) = detect_degenerate_cycle(history) {
+                let continuation = history[history.len() - period];
+                let excess = (cycles - 8).min(7);
+                let weight = (32_u32 << excess).min(500);
+                for row_idx in 0..block.len().min(MAX_VERIFY_TOKENS) {
+                    if self.dry_scratch.len() >= 1024 {
+                        break;
+                    }
+                    let tagged = ((row_idx as u32) << 24) | (continuation & 0x00FF_FFFF);
+                    self.dry_scratch.push([tagged, weight]);
+                }
+            }
+            self.last_cpu_ms = t_cpu.elapsed().as_secs_f64().mul_add(1e3, self.last_cpu_ms);
+            return;
+        }
+        if hist_len < search_start + 4 {
             return;
         }
         for row_idx in 0..block.len().min(MAX_VERIFY_TOKENS) {

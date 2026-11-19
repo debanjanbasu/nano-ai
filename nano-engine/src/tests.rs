@@ -383,6 +383,60 @@ fn dspark_scheduler_and_ngram_lookup_work() {
 }
 
 #[test]
+fn degenerate_cycle_detector_and_drafter_skip() {
+    use crate::dspark::{detect_degenerate_cycle, lookup_ngram_draft_adaptive};
+
+    // A 2-token unit repeated 12 times: detected with period 2 and the loop continuation token.
+    let looping: Vec<u32> = std::iter::repeat_n([7, 13], 12).flatten().collect();
+    let (period, cycles) = detect_degenerate_cycle(&looping).expect("12x [7,13] is a degenerate cycle");
+    assert_eq!(period, 2);
+    assert_eq!(cycles, 12);
+    assert_eq!(looping[looping.len() - period], 7, "continuation is the unit's first token");
+
+    // A longer 7-token unit repeated 9 times (the llama.cpp-surviving loop shape).
+    let unit = [1, 2, 3, 4, 5, 6, 7];
+    let looping7: Vec<u32> = std::iter::repeat_n(unit, 9).flatten().collect();
+    let (period7, cycles7) = detect_degenerate_cycle(&looping7).expect("9x 7-token loop detected");
+    assert_eq!(period7, 7);
+    assert_eq!(cycles7, 9);
+
+    // Legitimate structured repetition does NOT fire: 3 cycles (below the 8 threshold).
+    let json_keys: Vec<u32> = std::iter::repeat_n([100, 101, 102], 3).flatten().collect();
+    assert_eq!(detect_degenerate_cycle(&json_keys), None, "3 cycles is legitimate");
+    // Alternating but non-cyclic tail: no exact period repeats back-to-back.
+    let non_cyclic: Vec<u32> = (0..64).map(|i| (i * 7 + 3) % 251).collect();
+    assert_eq!(detect_degenerate_cycle(&non_cyclic), None);
+    // Fewer than 8 tokens: never fires.
+    assert_eq!(detect_degenerate_cycle(&[9, 9, 9]), None);
+
+    // The n-gram drafter must not feed a detected loop: the same history with DRY off would
+    // match its own suffix; with the cycle detected it drafts nothing.
+    let fed = lookup_ngram_draft_adaptive(&looping, true, 7);
+    assert!(fed.is_empty(), "drafter must not extend a degenerate cycle, got {fed:?}");
+    // And the cycle penalty lands in dry_scratch on an answer-round build.
+    if MetalContext::new().is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("nano_ai_cycle_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let model_path = dir.join("cycle_test.bin");
+    write_synthetic_lm_artifact(&model_path, false).unwrap();
+    let mut engine = NanoEngine::open(&model_path).unwrap();
+    engine.build_dry_penalties(&looping, &[7], false, 0);
+    let entries = engine.dry_scratch_entries();
+    // One entry per verify row (block = [anchor, 7] -> 1 row): row 0, token 7. 12 cycles means
+    // excess 4, so the count-term weight saturates at 500.
+    assert_eq!(entries, &[[7_u32, 500_u32]], "row-0 (tag 0) cycle penalty on token 7");
+    // Legitimate repetition on the same path stays unpunished (verbatim code copies remain free).
+    engine.build_dry_penalties(&json_keys, &[100], false, 0);
+    let entries: &[[u32; 2]] = engine.dry_scratch_entries();
+    assert!(
+        entries.iter().all(|&[t, _]| t >> 24 == 0xFF),
+        "only global rep-penalty entries expected, got {entries:?}"
+    );
+}
+
+#[test]
 #[expect(unsafe_code)]
 fn metal_ptq1_int4_and_fwht512_match_cpu_reference() {
     let Ok(ctx) = MetalContext::new() else {
