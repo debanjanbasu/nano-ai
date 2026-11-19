@@ -249,6 +249,20 @@ impl ConfidenceCalibrator {
         1.0 / (1.0 + (-linear).exp())
     }
 
+    /// Observed acceptance rate at `depth` over the recent ring, when enough rounds have been
+    /// seen. This is the quantity the scheduler actually needs (E(ℓ) multiplies survival across
+    /// depths), and it cannot be optimistic: it is what really happened. `None` during warmup.
+    #[must_use]
+    pub fn empirical_acceptance(&self, depth: usize) -> Option<f32> {
+        let idx = depth.min(DSPARK_MAX_BLOCK - 1);
+        let ring = &self.records[idx];
+        if ring.len() < CALIBRATOR_MIN_OBS {
+            return None;
+        }
+        let hits = ring.iter().filter(|&&(_, accepted)| accepted).count();
+        Some(hits as f32 / ring.len() as f32)
+    }
+
     pub fn observe(&mut self, raw_confs: &[f32], accepted_len: usize) {
         if raw_confs.is_empty() {
             return;
@@ -965,8 +979,17 @@ impl DsparkDrafter {
     /// Optimal number of Markov / `lm_head` draft steps (`3..=7`) to evaluate after the full 7-token block attention pass.
     #[must_use]
     pub fn recommended_forward_len(&self, max_draft: usize) -> usize {
-        let est_confs: [f32; DSPARK_MAX_BLOCK] =
-            std::array::from_fn(|d| self.calibrator.calibrate(d, 0.55));
+        // Scheduler confidences per depth: the empirical acceptance rate (what really happened
+        // in recent rounds) once enough observations exist, else the calibrated flat estimate.
+        // The flat estimate through the learned logistic proved optimistic on dense-reasoning
+        // prompts, where real acceptance at depth >= 2 collapses toward 0.2-0.3 while the
+        // calibrated model still predicted ~0.5 - so the scheduler kept drafting 4-7 rows that
+        // were mostly discarded. Empirical rates are unfoolable: they are the outcomes.
+        let est_confs: [f32; DSPARK_MAX_BLOCK] = std::array::from_fn(|d| {
+            self.calibrator
+                .empirical_acceptance(d)
+                .unwrap_or_else(|| self.calibrator.calibrate(d, 0.55))
+        });
         let rate = if self.rate_cycles >= 16 && self.recent_ms_sum > 0.1 {
             self.recent_tok_sum / self.recent_ms_sum
         } else {
@@ -986,13 +1009,33 @@ impl DsparkDrafter {
         } else {
             DSPARK_MAX_BLOCK
         };
+        // Once the token/ms rate is learned, trust the scheduler's optimum exactly: on prompts
+        // where deep speculation loses (low acceptance, e.g. dense reasoning), both the old
+        // `+2` premium and the `4` floor wasted verify rows and made speculation a net loss vs
+        // plain decode (measured: 115 vs 134 tok/s). The premium dates from unfused rounds,
+        // where extra walk steps overlapped the verify wait; under fusion the whole round is
+        // one serial batch, so every drafted row costs its verify. During warmup the
+        // conservative floor stays: with no rate data the flat-confidence estimate would
+        // otherwise collapse the block to 1 and disable speculation before it calibrates.
         // `max_draft` drops below 4 near `max_new_tokens`; `clamp` would panic there.
-        (sched + 2)
-            .max(4)
+        // The +2 premium pays only when deep rows are actually accepted (high-acceptance
+        // prompts gained from it); with the learned rate and empirical depths in hand, apply it
+        // only there, and trust the raw scheduler optimum otherwise.
+        let deep_pays = self
+            .calibrator
+            .empirical_acceptance(3)
+            .is_some_and(|a| a > 0.5);
+        let sched = if self.rate_cycles < 16 || deep_pays {
+            sched + 2
+        } else {
+            sched
+        };
+        let floor = if self.rate_cycles < 16 || deep_pays { 4 } else { 1 };
+        sched
+            .max(floor)
             .min(max_draft.min(margin_cap))
             .max(1)
     }
-
 
     /// Asynchronously run one `DSpark` semi-autoregressive drafting pass on the GPU with
     /// target repetition and frequency penalties applied post-Markov.
@@ -1033,7 +1076,7 @@ impl DsparkDrafter {
 
     /// Record verification outcome for the most recent `draft_block`, updating the online
     /// Newton-Raphson confidence calibrator and `draft_ms` / `verify_ms_table` EMAs.
-    pub fn record_verification(&mut self, accepted_len: usize, verify_ms: f32) {
+    pub fn record_verification(&mut self, accepted_len: usize, verify_ms: f32, cycle_ms: f32) {
         if self.last_raw_confs.is_empty() {
             return;
         }
@@ -1045,10 +1088,24 @@ impl DsparkDrafter {
         if verify_ms > 0.1 && verify_ms < 50.0 {
             self.verify_ms_table[drafted_len] =
                 0.85_f32.mul_add(self.verify_ms_table[drafted_len], 0.15 * verify_ms);
-            let cyc_ms = self.last_draft_ms.max(0.2) + verify_ms;
+        } else if cycle_ms > 0.1 && cycle_ms < 200.0 {
+            // Fused rounds cannot split draft from verify: the whole batch is the block-length
+            // cycle cost. Attribute the draft EMA's share to the draft and store the remainder
+            // as this block length's verify cost — otherwise the table keeps stale unfused
+            // prices, which overstate fused verify costs where they matter and understate them
+            // where they don't, biasing block depth either way.
+            let fused_verify = (cycle_ms - self.draft_ms).max(0.2);
+            self.verify_ms_table[drafted_len] =
+                0.85_f32.mul_add(self.verify_ms_table[drafted_len], 0.15 * fused_verify);
+        }
+        // The token/ms rate learns from every round: fused rounds report their whole batch as
+        // the cycle cost (they cannot split draft from verify), unfused rounds report
+        // draft + verify. Without this, fusion would freeze `rate_cycles` at its warmup value
+        // and the scheduler would never trust its own optimum.
+        if cycle_ms > 0.1 && cycle_ms < 200.0 {
             let cyc_toks = (accepted_len + 1) as f32;
             self.recent_tok_sum = 0.92_f32.mul_add(self.recent_tok_sum, cyc_toks);
-            self.recent_ms_sum = 0.92_f32.mul_add(self.recent_ms_sum, cyc_ms);
+            self.recent_ms_sum = 0.92_f32.mul_add(self.recent_ms_sum, cycle_ms);
             self.rate_cycles += 1;
         }
         self.last_raw_confs.clear();

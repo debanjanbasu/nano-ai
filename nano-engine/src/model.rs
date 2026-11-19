@@ -2851,9 +2851,9 @@ impl NanoEngine {
         let mut drafted_tokens = 0_usize;
         let mut accepted_tokens = 0_usize;
         let mut ngram_accepted_tokens = 0_usize;
-        // Drafts for the next round, whether they came from the n-gram lookup, and whether their
-        // verify block already ran in the previous round's batch.
-        let mut pending_drafts: Option<(Vec<u32>, bool, bool)> = None;
+        // Drafts for the next round: (drafts, from_ngram, pre_verified, measured cycle ms for
+        // fused rounds — the whole batch, since draft and verify cannot be split).
+        let mut pending_drafts: Option<(Vec<u32>, bool, bool, f32)> = None;
         let mut closed_thinking = !thinking_open || first.token_id == THINK_END_ID;
         if closed_thinking {
             self.rep_penalty = sampler.repetition_penalty();
@@ -2900,9 +2900,11 @@ impl NanoEngine {
             // Sampling verifies drafts by sampling each row (exact speculative sampling), but its
             // top-k pass per row made drafting a net loss (M4 Pro, T=0.7: 178 vs 261 tok/s), so
             // only greedy decoding drafts.
-            let drafts = if let Some((d_toks, from_ngram, verified)) = pending_drafts.take() {
+            let mut fused_cycle_ms = 0.0_f32;
+            let drafts = if let Some((d_toks, from_ngram, verified, ms)) = pending_drafts.take() {
                 used_ngram = from_ngram;
                 pre_verified = verified;
+                fused_cycle_ms = ms;
                 d_toks
             } else if remaining > 1 && sampler.is_greedy() {
                 let t_cpu = Instant::now();
@@ -3120,7 +3122,15 @@ impl NanoEngine {
                 if used_ngram {
                     ngram_accepted_tokens += accepted;
                 } else if let Some(d) = &mut self.drafter {
-                    d.record_verification(accepted, verify_ms);
+                    // Fused rounds report their whole measured batch as the cycle cost; unfused
+                    // rounds report their draft EMA plus the measured verify wait.
+                    let draft_ms = d.draft_ms;
+                    let measured_cycle_ms = if pre_verified {
+                        fused_cycle_ms
+                    } else {
+                        draft_ms + verify_ms
+                    };
+                    d.record_verification(accepted, verify_ms, measured_cycle_ms);
                 }
 
                 if accepted == draft_count {
@@ -3252,20 +3262,21 @@ impl NanoEngine {
                             (has_work || fused_draft_blk.is_some()).then(|| batch.commit_and_await())
                         }
                     };
+                    let mut batch_ms = 0.0_f32;
                     if let Some(fut) = fut_opt {
                         let t_batch = Instant::now();
                         fut.await?;
-                        let batch_ms = (t_batch.elapsed().as_secs_f64() * 1000.0) as f32;
+                        batch_ms = (t_batch.elapsed().as_secs_f64() * 1000.0) as f32;
                         if let (Some(blk_len), Some(drafter)) = (fused_draft_blk, &mut self.drafter) {
                             // shortcut: fused rounds cannot split draft from verify time, so they
                             // leave the cost tables to unfused (reasoning) rounds.
                             let draft_ms = if fused { 0.0 } else { batch_ms * 0.7 };
                             let (d_toks, _) = drafter.finish_draft_block(blk_len, draft_ms, fused);
-                            pending_drafts = Some((d_toks, false, fused));
+                            pending_drafts = Some((d_toks, false, fused, batch_ms));
                         }
                     }
                     if !ng_cpu.is_empty() {
-                        pending_drafts = Some((ng_cpu, true, fused));
+                        pending_drafts = Some((ng_cpu, true, fused, batch_ms));
                     }
                     continue;
                 }
