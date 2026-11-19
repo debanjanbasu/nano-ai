@@ -1303,6 +1303,12 @@ impl NanoEngine {
         )
     }
 
+    /// Read-only artifact access for the `lm_head` norm-gate probe test.
+    #[cfg(test)]
+    pub(crate) const fn artifact_for_probe(&self) -> &MappedArtifact {
+        &self.artifact
+    }
+
     /// Format a single-turn user prompt using MiniCPM-V 4.7's chat template (thinking always enabled).
     #[must_use]
     pub fn format_chat_prompt(prompt: &str) -> String {

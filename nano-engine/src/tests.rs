@@ -1052,3 +1052,127 @@ fn prefill_rows_calibration_keeps_state_clean() {
         .unwrap();
     assert_eq!(report.generated_tokens, 2);
 }
+
+/// Measures whether a Cauchy-Schwarz `lm_head` gate could skip the full-vocab pass on decode:
+/// `logit_row <= ||x||_2 * ||w_row||_2`, and after the final `RMSNorm`
+/// `||x||_2 <= sqrt(WIDTH) * ||final_norm||_inf`, both valid bounds. If the decode top-1 logit
+/// exceeds `||x||_2_bound * max_cold_row_norm`, the hot-pick is PROVABLY the vocab max and the
+/// cold 127 MB pass could be skipped. Run with:
+/// `cargo test -p nano-engine lm_head_norm_gate_probe -- --ignored --nocapture`
+/// (needs models/minicpm-v-4.7-1b/minicpm-v-4.7-1b-tern4.bin on disk).
+#[test]
+#[ignore = "measurement probe: needs the real artifact, run with --ignored --nocapture"]
+fn lm_head_norm_gate_probe() {
+    use crate::model::VOCAB;
+    use std::time::Instant;
+
+    let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../models/minicpm-v-4.7-1b/minicpm-v-4.7-1b-tern4.bin");
+    if !model_path.is_file() {
+        eprintln!("probe skipped: real artifact not found at {model_path:?}");
+        return;
+    }
+    let mut engine = NanoEngine::open(&model_path).unwrap();
+
+    // 1. Per-row L2 norms of the tied INT4_G64 lm_head (dequantized on CPU, once).
+    let artifact = engine.artifact_for_probe();
+    let lm = artifact.matrix_handle("lm_head.weight").unwrap();
+    let AnyMatrix::Int4(m) = artifact.matrix_at(lm).0 else {
+        panic!("probe assumes an INT4_G64 lm_head");
+    };
+    assert_eq!(m.rows as usize, VOCAB);
+    let cols = m.columns as usize;
+    #[expect(unsafe_code)]
+    let codes = unsafe { &m.codes.as_slice::<u8>()[m.codes_offset..] };
+    // `groups_offset` is a byte offset; `as_slice::<u32>` indexes 4-byte elements.
+    #[expect(unsafe_code)]
+    let groups = unsafe { &m.groups.as_slice::<u32>()[m.groups_offset / 4..] };
+    let t = Instant::now();
+    let mut row_norm_sq = vec![0.0_f32; VOCAB];
+    for row in 0..VOCAB {
+        let row_codes = &codes[row * cols / 2..(row + 1) * cols / 2];
+        let row_groups = &groups[row * (cols / 64)..];
+        let mut sq = 0.0_f64;
+        for (c, &byte) in row_codes.iter().enumerate() {
+            // Each `u32` group entry packs two f16s: (scale, bias) for 64 columns.
+            let pair = row_groups[c / 32];
+            let s = half::f16::from_bits(pair as u16).to_f32();
+            let b = half::f16::from_bits((pair >> 16) as u16).to_f32();
+            let lo = f64::from(f32::from(byte & 0x0F));
+            let hi = f64::from(f32::from(byte >> 4));
+            let slo = f64::from(s);
+            let blo = f64::from(b);
+            sq = hi.mul_add(hi.mul_add(slo, blo), lo.mul_add(lo.mul_add(slo, blo), sq));
+        }
+        row_norm_sq[row] = sq as f32;
+    }
+    let max_full_norm_sq = row_norm_sq.iter().copied().fold(0.0_f32, f32::max);
+    println!(
+        "row norms in {:.1?}: max ||w_row||_2 = {:.3}",
+        t.elapsed(),
+        max_full_norm_sq.sqrt()
+    );
+
+    // 2. Static ||x||_2 bound: sqrt(WIDTH) * ||final_norm||_inf.
+    let (norm_buf, norm_off, norm_len) = artifact.f32_slice("model.language_model.norm.weight").unwrap();
+    #[expect(unsafe_code)]
+    let norm_w = unsafe { &norm_buf.as_slice::<f32>()[norm_off / 4..norm_off / 4 + norm_len] };
+    let norm_inf = norm_w.iter().fold(0.0_f32, |a, &w| a.max(w.abs()));
+    let x_norm_bound = (cols as f32).sqrt() * norm_inf;
+    println!("||x||_2 bound = sqrt({cols}) * {norm_inf:.3} = {x_norm_bound:.3}");
+
+    // 3. Decode with per-step top-1 logits, counting gate fires against progressively larger
+    //    hot sets (hot = most frequent generated ids so far; cold = the rest).
+    let prompt: Vec<u32> = crate::quant::deterministic_signs(8)
+        .iter()
+        .map(|&s| (s.abs() * 1000.0) as u32 % 50_000)
+        .collect();
+    let mut history = prompt;
+    let mut fired_full = 0_usize;
+    let mut fired_hot16k = 0_usize;
+    let mut fired_hot64k = 0_usize;
+    let steps = 32;
+    for _ in 0..steps {
+        let params = SamplingParams {
+            eos_tokens: vec![999_999],
+            ..SamplingParams::default()
+        };
+        let rep = engine.generate_ids(&history, 1, params).unwrap();
+        let logits = engine.last_logits();
+        let top1 = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let bound = x_norm_bound * max_full_norm_sq.sqrt();
+        if top1 >= bound {
+            fired_full += 1;
+        }
+        // Hot-set variants: exclude the K most frequent history ids from the cold set.
+        let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for &id in &history {
+            *counts.entry(id).or_default() += 1;
+        }
+        let mut by_freq: Vec<(u32, usize)> = counts.into_iter().collect();
+        by_freq.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        for (hot_k, fired) in [(16_384, &mut fired_hot16k), (65_536, &mut fired_hot64k)] {
+            let hot: std::collections::HashSet<u32> =
+                by_freq.iter().take(hot_k).map(|&(id, _)| id).collect();
+            let max_cold = row_norm_sq
+                .iter()
+                .enumerate()
+                .filter(|(row, _)| !hot.contains(&(*row as u32)))
+                .map(|(_, &sq)| sq)
+                .fold(0.0_f32, f32::max)
+                .sqrt();
+            if top1 >= x_norm_bound * max_cold {
+                *fired += 1;
+            }
+        }
+        history.push(rep.token_ids[0]);
+    }
+    println!(
+        "gate fires over {steps} decode steps: full-vocab {fired_full}, hot-16k {fired_hot16k}, hot-64k {fired_hot64k}"
+    );
+    println!(
+        "gate bound = {x_norm_bound:.1} * {:.3} = {:.1}; typical top-1 logits are far below it, so the static bound never fires",
+        max_full_norm_sq.sqrt(),
+        x_norm_bound * max_full_norm_sq.sqrt()
+    );
+}
