@@ -30,6 +30,10 @@ use crate::model::{VOCAB, WIDTH};
 pub const DSPARK_LAYERS: usize = 5;
 pub const DSPARK_TAPS: [usize; 5] = [3, 7, 11, 15, 19];
 pub const DSPARK_MAX_BLOCK: usize = 7;
+/// Depth-0 score margin below which the chain's first token is treated as a coin flip and the
+/// next drafted block is capped short (`recommended_forward_len`). The pick kernel's scores are
+/// pre-softmax logits of one candidate set, so a gap under ~0.5 nats is indistinguishable noise.
+pub(crate) const DEPTH0_MARGIN_AMBIGUOUS: f32 = 0.5;
 pub const DSPARK_MASK_TOKEN: u32 = 248_076;
 pub const DSPARK_RANK: usize = 256;
 pub const DSPARK_HEAD_CUT: usize = 98_304;
@@ -349,6 +353,11 @@ pub struct DsparkDrafter {
     recent_tok_sum: f32,
     recent_ms_sum: f32,
     rate_cycles: usize,
+    /// Score gap between the best and second-best depth-0 candidate of the last drafted block
+    /// (`conf_out[7]` from `ds_markov_walk_pick_int4`; `f32::INFINITY` before the first block).
+    /// A tiny margin means the chain's first token was a coin flip, so a long verify block would
+    /// mostly be discarded rows.
+    last_depth0_margin: f32,
 }
 impl DsparkDrafter {
     pub fn open(ctx: &MetalContext, shaders: &ShaderLibrary, path: &Path) -> crate::Result<Self> {
@@ -441,12 +450,14 @@ impl DsparkDrafter {
             recent_tok_sum: 0.0,
             recent_ms_sum: 0.0,
             rate_cycles: 0,
+            last_depth0_margin: f32::INFINITY,
         })
     }
     pub fn reset(&mut self) {
         self.context_len = 0;
         self.scored_anchors = 0;
         self.last_raw_confs.clear();
+        self.last_depth0_margin = f32::INFINITY;
     }
 
     pub const fn truncate_context(&mut self, new_len: usize) {
@@ -859,14 +870,21 @@ impl DsparkDrafter {
         draft_elapsed_ms: f32,
         verified_all: bool,
     ) -> (Vec<u32>, Vec<f32>) {
-        let (all_drafts, raw_confs) = unsafe {
+        let (all_drafts, raw_confs, margin) = unsafe {
             let draft_full = self.draft_tokens.as_slice::<u32>();
             let conf_full = self.conf_out.as_slice::<f32>();
+            let margin = if draft_full[8] == u32::MAX {
+                f32::INFINITY
+            } else {
+                conf_full[7]
+            };
             (
                 draft_full[1..=block_len].to_vec(),
                 conf_full[..block_len].to_vec(),
+                margin,
             )
         };
+        self.last_depth0_margin = margin;
         let calibrated_confs: Vec<f32> = raw_confs
             .iter()
             .enumerate()
@@ -915,8 +933,19 @@ impl DsparkDrafter {
             &self.verify_ms_table,
             rate,
         );
+        // The depth-0 score margin is a second signal the calibrated confidences do not capture:
+        // a coin-flip first token predicts a mostly-discarded verify block regardless of the
+        // confidence EMA, so cap the next block short and re-widen once a confident pick returns.
+        let margin_cap = if self.last_depth0_margin < DEPTH0_MARGIN_AMBIGUOUS {
+            3
+        } else {
+            DSPARK_MAX_BLOCK
+        };
         // `max_draft` drops below 4 near `max_new_tokens`; `clamp` would panic there.
-        (sched + 2).max(4).min(max_draft.min(DSPARK_MAX_BLOCK)).max(1)
+        (sched + 2)
+            .max(4)
+            .min(max_draft.min(margin_cap))
+            .max(1)
     }
 
 
