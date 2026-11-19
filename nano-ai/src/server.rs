@@ -834,30 +834,7 @@ fn parse_chat_completion_body(body: &[u8]) -> Result<ChatCompletionInput, &'stat
         .and_then(serde_json::Value::as_u64)
         .map_or(DEFAULT_CHAT_MAX_TOKENS, |val| val as usize);
     let mut params = SamplingParams::default();
-    if let Some(temp) = req_json
-        .get("temperature")
-        .and_then(serde_json::Value::as_f64)
-    {
-        params.temperature = temp as f32;
-        if params.temperature > 0.0 && params.top_k == 1 {
-            params.top_k = 100;
-        }
-    }
-    if let Some(top_p) = req_json.get("top_p").and_then(serde_json::Value::as_f64) {
-        params.top_p = top_p as f32;
-    }
-    if let Some(top_k) = req_json.get("top_k").and_then(serde_json::Value::as_u64) {
-        params.top_k = top_k as usize;
-    }
-    if let Some(min_p) = req_json.get("min_p").and_then(serde_json::Value::as_f64) {
-        params.min_p = min_p as f32;
-    }
-    if let Some(rep) = req_json.get("repetition_penalty").and_then(serde_json::Value::as_f64) {
-        params.repetition_penalty = rep as f32;
-    }
-    if let Some(seed) = req_json.get("seed").and_then(serde_json::Value::as_u64) {
-        params.seed = seed;
-    }
+    apply_sampling_params(&mut params, &req_json);
     let stream_pieces = req_json
         .get("stream")
         .and_then(serde_json::Value::as_bool)
@@ -872,6 +849,34 @@ fn parse_chat_completion_body(body: &[u8]) -> Result<ChatCompletionInput, &'stat
         tools,
         forced_prefix,
     })
+}
+
+/// Apply the `OpenAI` sampling parameters both endpoints accept: `temperature`, `top_p`, `top_k`,
+/// `min_p`, `repetition_penalty`, `seed`. A positive temperature with `top_k == 1` widens the
+/// candidate set to 100 so sampling has something to choose from.
+fn apply_sampling_params(params: &mut SamplingParams, v: &serde_json::Value) {
+    use serde_json::Value;
+    if let Some(temp) = v.get("temperature").and_then(Value::as_f64) {
+        params.temperature = temp as f32;
+        if params.temperature > 0.0 && params.top_k == 1 {
+            params.top_k = 100;
+        }
+    }
+    if let Some(top_p) = v.get("top_p").and_then(Value::as_f64) {
+        params.top_p = top_p as f32;
+    }
+    if let Some(top_k) = v.get("top_k").and_then(Value::as_u64) {
+        params.top_k = top_k as usize;
+    }
+    if let Some(min_p) = v.get("min_p").and_then(Value::as_f64) {
+        params.min_p = min_p as f32;
+    }
+    if let Some(rep) = v.get("repetition_penalty").and_then(Value::as_f64) {
+        params.repetition_penalty = rep as f32;
+    }
+    if let Some(seed) = v.get("seed").and_then(Value::as_u64) {
+        params.seed = seed;
+    }
 }
 
 fn build_chat_completion_json(
@@ -988,15 +993,7 @@ async fn completions(
     let scored_mode = echo || req.get("logprobs").is_some_and(|v| !v.is_null());
     let stops = parse_stops(req.get("stop"))?;
     let mut params = SamplingParams::default();
-    if let Some(temp) = req.get("temperature").and_then(Value::as_f64) {
-        params.temperature = temp as f32;
-        if params.temperature > 0.0 && params.top_k == 1 {
-            params.top_k = 100;
-        }
-    }
-    if let Some(top_p) = req.get("top_p").and_then(Value::as_f64) {
-        params.top_p = top_p as f32;
-    }
+    apply_sampling_params(&mut params, &req);
     let (mut prompt_tokens, mut completion_tokens) = (0, 0);
     let mut choices = Vec::new();
     for (index, prompt) in prompts.into_iter().enumerate() {
