@@ -9,7 +9,14 @@
 //! - Shared output head (`lm_head`) with ID-order frequency cut (first 98,304 rows + special tokens) for 2.5x faster draft scoring.
 //! - Sequential low-rank (`r = 256`) Markov head (`markov_w1`, `markov_w2`) + Confidence head (`σ(w^T [h_k; markov_w1[x_{k-1}]] + b)`),
 //!   executed entirely on the GPU without host round-trips per draft position.
-//! - Hardware-Aware Prefix Scheduler: selects optimal verification length `ℓ*` maximizing `Θ(ℓ) = (1 + Σ_{j=1}^ℓ ∏_{i≤j} c_i) / T_verify(1 + ℓ)`.
+//! - Hardware-Aware Prefix Scheduler: selects verification length `ℓ*` maximizing
+//!   `Θ(ℓ) = (1 + Σ_{j=1}^ℓ ∏_{i≤j} c_i) − rate · (draft_ms + verify_ms[ℓ])`, where the per-depth
+//!   confidences `c_i` are the **empirical acceptance rates** observed in the calibrator's rings
+//!   (every depth is observed every round — undrafted depths count as rejected — so the rates
+//!   cannot be survivorship-biased), and `rate` is a learned token/ms EMA that fused rounds
+//!   (whose draft and verify share one measured batch) also teach. A depth-0 score margin below
+//!   0.5 nats caps the next block short, and the depth-3 premium applies only where deep rows
+//!   empirically pay.
 
 use std::collections::VecDeque;
 use std::path::Path;

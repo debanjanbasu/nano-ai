@@ -1,7 +1,7 @@
 //! Native Metal execution of MiniCPM-V 4.7 1B (`openbmb/MiniCPM-V-4.7-1B`):
 //! - 24-layer Qwen3.5-0.8B hybrid backbone (`width = 1024`, `ffn = 3584`, `vocab = 248,094`):
 //!   - 18 Gated `DeltaNet` recurrent layers (`layers % 4 != 3`), F16 state `[16 * 128][128]` with zero-copy rollback
-//!   - 6 Full-Attention layers (`layers 3, 7, 11, 15, 19, 23`), rotated Q8 KV cache (544 B/token/layer = 3.19 KiB/token total)
+//!   - 6 Full-Attention layers (`layers 3, 7, 11, 15, 19, 23`), rotated KV cache adaptive between Q8 (544 B/token/layer) and Q4 (288) by context length — see `apply_kv_format_for_position`
 //! - Canvas 3D M-RoPE (`sections = [11, 11, 10]`, `partial_rotary_factor = 0.25`)
 //! - Optional `SigLIP2` + Window-Attention Merger vision tower (`16x` and `4x` modes)
 //! - Speculative decoding: `DSpark` 5-layer semi-autoregressive drafter + N-gram prompt-lookup drafter

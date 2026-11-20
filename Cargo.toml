@@ -54,7 +54,7 @@ objc2-foundation = { version = "0.3", default-features = false }
 objc2-metal = "0.3"
 objc2-core-foundation = { version = "0.3.2", default-features = false }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2", "objc2-core-foundation"] }
-zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder"] }
+zstd = { version = "0.14.4", default-features = false, features = ["zdict_builder"] }
 console = "0.16"
 termimad = "0.35"
 unicodeit = "0.2"
