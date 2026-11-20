@@ -67,19 +67,17 @@ Greedy decoding with DSpark + n-gram speculation; prompt-processing numbers are 
 
 | Device | Workload | Prefill | Decode | Peak footprint |
 | --- | --- | --- | --- | --- |
-| M4 Pro | Text, 867-token prompt | **~3,570 tok/s** (ANE FFN) | **~540–608 tok/s** | 258 MB (`chat`) |
-| M4 Pro | Image (bald eagle, `16x`) | 2,236 tok/s | 379 tok/s | 482 MB |
-| iPhone SE 3 (A15, 4 GB) | Text, 867-token prompt | **~415 tok/s** (ANE FFN) | 48–58 tok/s (pre-fix baseline) | ~220 MiB |
-| iPhone SE 3 (A15, 4 GB) | Short prompt (31 tokens) | 274 tok/s (GPU) | 48 tok/s (pre-fix baseline) | 164 MiB |
-| iPhone SE 3 (A15, 4 GB) | Image, steady state | 409 tok/s | 55 tok/s, ~5.1 s per answer | ~357 MiB |
-| iPhone SE 3 (A15, 4 GB) | Text, 600-token answers (this build: empirical scheduler) | 336–737 tok/s | **58–74 tok/s** (dense reasoning 65, counting 74) | ~1.09 GiB peak |
-| Apple M2 (16 GB) | Text, dense reasoning / counting | — | 129–130 / ~220 tok/s | — |
+| Apple M2 (16 GB) | Text, dense reasoning / counting | 1,659–2,818 tok/s | **131–132 / 224–226 tok/s** | — |
+| iPhone SE 3 (A15, 4 GB) | Text, dense reasoning / counting | 641–886 tok/s | **62–64 / 94 tok/s** | ~1.09 GiB peak |
+| M4 Pro (earlier build) | Text, 867-token prompt | ~3,570 tok/s (ANE FFN) | ~540–608 tok/s | 258 MB (`chat`) |
+| M4 Pro (earlier build) | Image (bald eagle, `16x`) | 2,236 tok/s | 379 tok/s | 482 MB |
+| iPhone SE 3 (A15, earlier build) | Image, steady state | 409 tok/s | 55 tok/s, ~5.1 s per answer | ~357 MiB |
 
 On the SE 3 the ANE beats the GPU from 256-row chunks up (415 vs ~290 tok/s) and runs the vision MLP in ~3.2 s per image against ~5.3 s on the GPU alone.
 
-SE 3 speculative decode (600-token answers, this build): 65 tok/s with dense reasoning open (drafted/round 1.7 at 40% acceptance — the empirical scheduler keeps blocks short where deep verify rows roll back) and 74 tok/s on a high-acceptance counting prompt (1.2 drafted/round at 75%). Reproducing an earlier build's failure mode on purpose: a verbatim code lock-in that previously consumed the full 262K window now breaks after ~8 cycles via the degenerate-cycle breaker, and the n-gram drafter stops feeding it. Run the same benchmark yourself with `UDID=<device> ./ios/test-device.sh`.
+SE 3 speculative decode (600-token answers, current build): 62–64 tok/s with dense reasoning open (drafted/round 1.6 at ~40% acceptance — the empirical scheduler keeps blocks short where deep verify rows roll back) and 94 tok/s on a high-acceptance counting prompt (2.9 drafted/round at 62%). Reproducing an earlier build's failure mode on purpose: a verbatim code lock-in that previously consumed the full 262K window now breaks after ~8 cycles via the degenerate-cycle breaker, and the n-gram drafter stops feeding it. Run the same benchmark yourself with `UDID=<device> ./ios/test-device.sh`.
 
-Long context on the M4 Pro (needle-in-a-haystack over real Rust sources, needle at the halfway point, `evals/niah.py`): 16K prompt 3,039 tok/s prefill and 190 tok/s decode, 64K prompt 1,648 tok/s and 110 tok/s, 131K prompt 909 tok/s and 111 tok/s — the passphrase is retrieved exactly at every size up to 131K. At 254K tokens (the 262K window's edge) the answer degrades to the numeric half of the passphrase, and a 270K prompt is rejected with a context-window error.
+Long context on the M4 Pro (earlier build; needle-in-a-haystack over real Rust sources, needle at the halfway point, `evals/niah.py`): 16K prompt 3,039 tok/s prefill and 190 tok/s decode, 64K prompt 1,648 tok/s and 110 tok/s, 131K prompt 909 tok/s and 111 tok/s — the passphrase is retrieved exactly at every size up to 131K. At 254K tokens (the 262K window's edge) the answer degrades to the numeric half of the passphrase, and a 270K prompt is rejected with a context-window error.
 
 ## Quality
 
