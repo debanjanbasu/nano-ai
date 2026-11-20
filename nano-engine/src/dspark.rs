@@ -267,11 +267,21 @@ impl ConfidenceCalibrator {
         if raw_confs.is_empty() {
             return;
         }
-        let max_d = accepted_len
-            .min(raw_confs.len().saturating_sub(1))
-            .min(DSPARK_MAX_BLOCK - 1);
-        for depth in 0..=max_d {
-            let prob = raw_confs[depth].clamp(1e-4, 1.0 - 1e-4);
+        // Observe EVERY depth every round: depths beyond this round's drafted length count as
+        // not accepted. Restricting observations to the depths a round actually reached makes
+        // the deep-depth rings survivorship-biased — they only see rounds where the shallower
+        // depths were accepted, so `empirical_acceptance(3+)` reads high and the scheduler
+        // keeps drafting deep blocks that mostly roll back (measured on the A15: 4.0 drafted
+        // per round at 21% overall acceptance, while a depth-1 cap ran 12% faster).
+        let conf_at = |depth: usize| -> f32 {
+            raw_confs
+                .get(depth)
+                .copied()
+                .unwrap_or(0.5)
+                .clamp(1e-4, 1.0 - 1e-4)
+        };
+        for depth in 0..DSPARK_MAX_BLOCK {
+            let prob = conf_at(depth);
             let logit_q = (prob / (1.0 - prob)).ln();
             let accepted = depth < accepted_len;
             let ring = &mut self.records[depth];
@@ -408,6 +418,9 @@ pub struct DsparkDrafter {
     pub draft_ms: f32,
     pub calibrator: ConfidenceCalibrator,
     last_raw_confs: Vec<f32>,
+    /// Walk length of the last drafted block: the verify that ran had this many rows, so it
+    /// indexes the per-block-length verify cost table.
+    last_draft_block_len: usize,
     last_draft_ms: f32,
     recent_tok_sum: f32,
     recent_ms_sum: f32,
@@ -505,6 +518,7 @@ impl DsparkDrafter {
             draft_ms: 0.9,
             calibrator: ConfidenceCalibrator::new(),
             last_raw_confs: Vec::with_capacity(DSPARK_MAX_BLOCK),
+            last_draft_block_len: 1,
             last_draft_ms: 0.9,
             recent_tok_sum: 0.0,
             recent_ms_sum: 0.0,
@@ -962,8 +976,12 @@ impl DsparkDrafter {
             rate,
         );
         let kept = if verified_all { block_len } else { scheduled_len.clamp(1, block_len) };
+        // Keep the FULL block's raw confs: the calibrator must observe every depth every round
+        // (undrafted depths as not-accepted), or the deep-depth acceptance rates become
+        // survivorship-biased and the scheduler keeps drafting blocks that mostly roll back.
         self.last_raw_confs.clear();
-        self.last_raw_confs.extend_from_slice(&raw_confs[..kept]);
+        self.last_raw_confs.extend_from_slice(&raw_confs[..block_len.min(raw_confs.len())]);
+        self.last_draft_block_len = block_len;
         (
             all_drafts[..kept].to_vec(),
             calibrated_confs[..kept].to_vec(),
@@ -1080,7 +1098,7 @@ impl DsparkDrafter {
         if self.last_raw_confs.is_empty() {
             return;
         }
-        let drafted_len = self.last_raw_confs.len().min(DSPARK_MAX_BLOCK);
+        let drafted_len = self.last_draft_block_len.min(DSPARK_MAX_BLOCK);
         self.calibrator.observe(&self.last_raw_confs, accepted_len);
         if self.last_draft_ms > 0.05 && self.last_draft_ms < 20.0 {
             self.draft_ms = 0.85_f32.mul_add(self.draft_ms, 0.15 * self.last_draft_ms);
